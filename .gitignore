@@ -1,0 +1,49 @@
+# Visual Studio local state
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Build directories (any project depth)
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+Win32/
+ipch/
+
+# Compiler, linker and executable outputs
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.pch
+*.ipdb
+*.iobj
+*.tlog
+*.lastbuildstate
+*.exp
+*.res
+
+# Received content and isolated test outputs
+received/
+tests/runs/
+*.part
+*.log
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+
+# Local agent/account configuration
+.codex/
+.agents/
+.aws/

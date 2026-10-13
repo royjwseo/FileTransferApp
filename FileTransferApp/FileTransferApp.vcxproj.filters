@@ -1,0 +1,36 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClInclude Include="include\Protocol.h">
+      <Filter>incluude</Filter>
+    </ClInclude>
+    <ClInclude Include="include\Network.h">
+      <Filter>incluude</Filter>
+    </ClInclude>
+    <ClInclude Include="include\FileTransfer.h">
+      <Filter>incluude</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\Network.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Protocol.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\FileTransfer.cpp">
+      <Filter>src</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="incluude">
+      <UniqueIdentifier>{2c51517d-ff1b-4fe3-9924-61b3f89acd4e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="src">
+      <UniqueIdentifier>{62475e2d-f6c6-4732-a18a-ba10b4b54aea}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
