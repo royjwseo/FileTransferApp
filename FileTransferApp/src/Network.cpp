@@ -524,16 +524,20 @@ bool Network::AcceptFile()
     }
     uint64_t id;
     std::vector<Protocol::Reply> replies;
+    // A response validated on the old session must never be published on its
+    // replacement socket. Do not hold this lock during the recovery hash scan.
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
         id = protocol_.ApproveFileRequest(request, std::move(prepared), error);
-        replies = protocol_.TakeReplies();
+        if (id) replies = protocol_.TakeReplies();
     }
     if (!id) return false;
     return SendReplies(std::move(replies));
 }
 bool Network::RejectFile()
 {
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
     uint64_t id;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
@@ -598,6 +602,7 @@ bool Network::Reconnect()
 {
     // No new socket can be adopted until an old SendFile has returned.
     std::lock_guard<std::mutex> fileLock(fileSendMutex_);
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
     if (userStopping_ || !endpointPort_) return false;
     Disconnect();
     {

@@ -84,4 +84,7 @@ private:
     bool WaitForState(Protocol::SendState waiting, std::chrono::seconds timeout);
     // 송신 중 중복 파일 요청 방지
     std::mutex fileSendMutex_;
+    // Serialize console approval/rejection publication with socket replacement.
+    // Reconnect acquires fileSendMutex_ first; never reverse that order.
+    std::mutex controlMutex_;
 };

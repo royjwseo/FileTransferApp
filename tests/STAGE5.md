@@ -1,6 +1,6 @@
 ﻿# 5단계: 취소·재접속·이어받기·무결성 — 최종 검증 미완료
 
-기준 커밋 `b87ff47`. 구현과 테스트 보강은 로컬 보존 브랜치 `feature/stage5-recovery`에 기록한다. **최신 Debug/Release 실행 파일이 Smart App Control에 차단되어 전체 188개 회귀 및 신규 테스트 완료를 선언할 수 없다.** 이번 커밋은 개발 상태 보존용이며 출시·검증 완료를 뜻하지 않는다. `main`은 안정적인 4단계 `b87ff47`에 유지하며 원격 push와 main 병합은 하지 않는다. 아래 과거 실행 결과는 당시 빌드의 결과이며 최신 빌드 통과로 대체하지 않는다.
+기준 커밋 `b87ff47`, 최초 로컬 보존 커밋 `32391b3` (`feature/stage5-recovery`)를 유지한다. **2026-10-14 최종 검증 시도에서도 Debug 및 오류 주입 Release의 SAC 차단으로 전체 188개 회귀를 완료하지 못했다.** 실행 가능한 보존 Release의 회귀 89개·신규 26개가 통과했고, 이후 안정화 수정의 Release 관련 테스트 21개가 통과했다. 서로 다른 빌드의 중복 항목을 합산하지 않는다. 이번 안정화 수정은 같은 브랜치의 후속 로컬 보존 커밋으로 기록하며 출시·검증 완료를 뜻하지 않는다. `main`은 안정적인 4단계 `b87ff47`에 유지하고 원격 push와 main 병합은 하지 않는다. 아래 이전 실행 기록은 당시 빌드의 결과다. 현재 결과는 마지막 절을 기준으로 확인한다.
 
 ## 실행 경로 및 보안 진단
 
@@ -152,3 +152,68 @@ Runner는 각 스크립트의 exit code/PASS 수/시간/로그를 tests/runs/sui
 기존 `.gitignore`는 유지한다. `tests/runs/`, `received/`, `.env`, `.codex/`, `.agents/`, `.aws/`, 빌드 디렉터리와 바이너리·인증서·키·로그는 커밋에 포함하지 않는다. 로컬 테스트 증거 경로와 exe 해시는 문서에만 기록하며 원시 이벤트 XML/로그·테스트 데이터·대용량 파일·산출물은 추적하지 않는다. 제외된 로컬 파일은 삭제하지 않는다. reset/변경 폐기/강제 push를 수행하지 않는다.
 
 알려진 제한: ASCII 파일명, IPv4 수동 연결, 자동 버전 협상/암호화/상대 인증 없음. SHA-256과 DPAPI는 상대방 인증을 대신하지 않는다. DPAPI manifest는 같은 Windows 사용자 환경에 묶인다. 파일명이 달라지면 transferId도 달라진다. 단일 송신/수신 작업 구조이며 동시 같은 목적지 파일은 독점 핸들로 거부한다. 승인/복구 검사는 기존 60초 요청 기한을 따르므로 매우 느린 대용량 해시 스캔은 타임아웃될 수 있다. 전원 손실·스토리지 장치 오류까지 내구성을 보장하지 않으며 crash 게시 중 orphan 파일은 자동으로 삭제/복구하지 않는다. GUI/LAN 자동 검색은 미구현이다. 향후 UI/검색은 Network 소켓·스레드 소유권을 유지하고 명령/상태/진행 이벤트를 연결해야 한다.
+
+## 최종 검증 시도 (2026-10-14, 보존 커밋 이후)
+
+시작 시 feature/stage5-recovery=`32391b3`, main=`b87ff47`, 작업 트리 clean을 확인했다. 보존 커밋의 표준 바이너리를 각각 한 번 `--version`으로 .NET Process.Start에서 실행했다. Debug는 차단, Release는 exit 0이었다. 반복 빌드로 신뢰 판정을 바꾸거나 차단 파일을 다른 위치/이름으로 실행하지 않았다.
+
+### 실행 환경 결과와 증거
+
+| KST | 실제 실행 파일 | SHA-256 | 결과 |
+| --- | --- | --- | --- |
+| 12:33:38 | `FileTransferApp/x64/Debug/FileTransferApp.exe` | `C70F4D16F88EA2087CF73145D0BAB23B5D9E602D9BB4CAB22E68F4D0E7A9DDF7` | SAC, 3077 record 202 / 3118 record 204 |
+| 검증 시작 | `FileTransferApp/x64/Release/FileTransferApp.exe` | `A90595EC8F91B3FCF8319A6CDFEA15397A0F8224BF013FFE2B4200E6821C6001` | 실행 가능, 보존 코드 테스트에 사용 |
+| 12:36:47 | `tests/runs/stage5-fault/Release/bin/FileTransferApp.exe` | `0428437116D98178D930651F4B5CC5DC362121F5A872A894BA074F9B1C9D63D4` | SAC, 3077 record 207 / 3118 record 209 |
+
+차단 오류는 두 경우 모두 `An Application Control policy has blocked this file`, 실행 요청은 Windows 기본 powershell.exe, 정책 GUID는 `{0283ac0f-fff1-49ae-ada1-8a933130cad6}`다. Debug 차단은 이전과 동일 파일 해시에서 지속됨을 확인했다. 일반 Release의 이전 차단이 이번에는 발생하지 않은 이유는 확보한 이벤트만으로 확정하지 않는다. 보안 정책이나 exe 내용은 실행 확인을 위해 변경하지 않았다.
+
+실행 확인 JSON과 이벤트 XML: `tests/runs/final-probe-170941f32f0d442682e6428da0a5878a/`. 전체 runner 결과: `tests/runs/suite-ba048921dd1e4113abc74931e2bf61ec/results.json` 및 stage별 로그. 오류 주입 빌드의 첫 차단에서 해당 suite는 중단했다. 차단된 Debug와 오류 주입 exe를 같은 조건으로 반복 실행하지 않았다. 실행 가능한 일반 Release에만 의존하는 신규 테스트는 별도로 진행했다.
+
+### 실제 테스트 집계
+
+| 대상 빌드/스크립트 | 통과 | 나머지 결과 |
+| --- | ---: | --- |
+| 보존 Release stage1 | 12 | 모두 통과 |
+| 보존 Release stage2 | 20 | 모두 통과 |
+| 보존 Release stage3 | 27 | 모두 통과 |
+| 보존 Release stage3_validation | 16 | 모두 통과 |
+| 보존 Release stage4 | 14 | 오류 주입 5개는 실행 파일 차단으로 미실행 |
+| 보존 Release stage5_cancel | 6 | 모두 통과 |
+| 보존 Release stage5_reconnect | 4 | 모두 통과 |
+| 보존 Release stage5_resume | 12 | 보강한 변조·원본 잠금·완료 조회 포함 모두 통과 |
+| 보존 Release stage5_boundaries | 4 | 양방향 한쪽 취소 검사 실패, 아래 테스트 수정 후 통과 |
+| 안정화 후 Release stage5_reconnect | 4 | 모두 통과 |
+| 안정화 후 Release stage5_boundaries | 5 | 모두 통과 |
+| 안정화 후 Release stage5_resume | 12 | 모두 통과 |
+| Debug 전체 | 0 | 실행 차단으로 미실행. 수정 후 새 Debug는 컴파일만 확인하고 반복 실행하지 않음 |
+
+보존 Release에서는 **기존 89개 + 신규 26개 = 115개 통과**, 신규 1개 실패를 기록했다. 기존 필수 188개 중 이번 시도에서 통과한 항목은 89개이며 Debug 94개 및 Release 오류 주입 5개는 미검증이다. 안정화 후 Release의 **관련 21개 통과**는 다른 빌드의 중복 항목이므로 115개에 더하지 않는다. 최신 코드의 188개 전체 회귀가 통과한 결과는 아니다.
+
+이번에도 실제 1GiB+64KiB와 4GiB+64KiB 전체 TCP 전송 및 SHA-256, 양방향 256MiB, 느린 수신자, 동일 연결 12회 메모리/핸들 검사가 통과했다. 신규 테스트에서는 프로세스 종료/재시작과 두 번 재중단 후 복구, 1GiB 이상 실제 재개, part/manifest/foreign 파일 변조 거부, 원본 쓰기 잠금·변경 거부, ACK 유실 뒤 반복 /status와 완료 파일 변조 거부, 취소/ACK 경합 10쌍을 확인했다. 4GiB+1 offset 시험은 실제 원본/prefix hash와 tail TCP를 사용한 raw-peer 경계 시뮬레이션이며 실제 수신자 checkpoint의 4GiB 재개 성공을 뜻하지 않는다. 두 PC LAN은 미검증이다.
+
+보존 신규 테스트 로그: `fd173da6844b4a46941e54302795cd6b/`(cancel), `2a9cb83aa0d94e308ecf1ec3aeb52d42/`(reconnect), `56df15668d154a5ebfb44902256e2969/`(resume), 모두 tests/runs 아래다. 수정 후 로그는 `tests/runs/final-targeted-55e3680e93da42349e7125eaa9d60db7/`의 3개 스크립트 로그와 builds.json에 기록했다.
+
+### 최종 코드 검토 및 안정화 수정
+
+- 소켓 shutdown→I/O 잠금 확보→close와 종료 시 sender/receiver join, 재접속 시 fileSendMutex 확보 순서를 검토했다. ACK 확인 후 Completed를 종료로 되돌리지 않는 규칙을 유지했다.
+- 승인/거절의 Protocol 검증 후 실제 send 전에 자동 재접속이 소켓을 교체할 수 있는 경합을 발견했다. `Network::controlMutex_`로 콘솔 응답 확정·발행과 Reconnect의 소켓 교체를 직렬화했다. 긴 복구 해시에는 이 잠금을 잡지 않는다. Reconnect 잠금 순서는 fileSendMutex→controlMutex이며 반대로 획득하는 경로는 추가하지 않았다. protocolMutex를 잡은 채 소켓 I/O를 하지 않는다.
+- 오래된 승인 작업이 세대 검사에서 거부됐을 때 새 세션의 응답 큐를 TakeReplies로 가져와 버리는 경로도 막았다. 유효한 승인일 때만 큐를 가져온다. 세션 경합의 정확한 스케줄을 고정한 전용 재현 테스트는 아직 없으며 관련 기능 테스트 21개와 정적 잠금 검토 범위의 검증이다.
+- 신규 양방향 취소 테스트 실패는 첫 파일의 CHUNK를 너무 일찍 멈추어 반대 방향 ACCEPT도 같은 TCP 흐름에서 막은 시나리오였다. 양쪽 Sending을 확인한 뒤에만 데이터 중계를 멈추도록 수정했다. 수정 후 반대 방향 파일·ACK·SHA-256이 유지됨을 실제 TCP로 확인했다.
+- RAII data/manifest/directory 핸들, CREATE_NEW/no-replace rename, DPAPI+volume/file identity, 전체/prefix SHA-256, 완료 캐시/취소 tombstone 상한, 잘못된 상태/크기 처리 및 최종 파일 보존 경로를 검토했다. 전원 손실 내구성, 강제 디스크 I/O 취소와 모든 스케줄의 데이터 레이스 부재를 입증한 것은 아니다.
+
+안정화 후 표준 Debug/Release x64 빌드 모두 성공했다. 최신 Release SHA-256은 `1226AE722315956CD7BE3D20F3D48E9E3DFA4D2E072068B3E8A180FDB77195EE`, 최신 Debug는 `2E1D0BFDEB48C1093EC9A30BBBDE22986DA900FA2D1BE973315895E535631106`이다. 이전 차단 이벤트 해시는 이전 바이너리에 대한 증거이며 새 Debug가 차단됐다고 추정하지 않는다. 최신 Debug 및 동일 수정의 오류 주입 빌드/전체 suite는 승인된 환경에서 재검증해야 한다. 바이너리 해시 변경은 위 안전성 수정의 정상 컴파일 결과이며 차단 회피용 변형을 하지 않았다.
+
+### 승인된 테스트 환경에서 완료하는 절차
+
+1. 담당 관리자/보안 담당자에게 위 두 차단 경로·해시·SAC 이벤트와 최초 보존 커밋 `32391b3`, 후속 안정화 로컬 커밋 및 두 커밋 간 diff를 제공한다. 현재 검증 대상 커밋은 `git rev-parse feature/stage5-recovery`로 확인한다. 개인정보를 포함할 수 있는 원시 이벤트 로그는 Git에 넣지 않는다.
+2. 조직이 승인한 Windows x64 개발/CI 검증 호스트를 준비하거나, 신뢰할 수 있는 제공자의 코드 서명 서비스로 **같은 소스의 표준 Debug/Release와 오류 주입 Debug/Release 4개**를 정식 서명한다. 인증서/개인 키를 저장소에 넣지 않는다. 이 작업에서 인증서 발급·서명·정책 변경을 수행하지 않았다.
+3. 해당 환경에서도 SAC/방화벽/실행 정책을 임의로 끄거나 예외 우회를 만들지 않는다. 일반 관리자 실행이나 자체 서명 신뢰 루트 추가를 해결책으로 사용하지 않는다. [Microsoft 정식 코드 서명 안내](https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/code-signing-for-smart-app-control), [개별 앱 예외가 없는 SAC FAQ](https://support.microsoft.com/en-us/windows/security/threat-malware-protection/smart-app-control-frequently-asked-questions)를 따른다.
+4. 앞 절의 C++20/Windows SDK/PowerShell/NTFS/10GiB/localhost 포트 요구 사항을 확인한다. 서명 전후 파일 해시 및 서명 검증 결과와 소스 diff를 기록하고 실행 허용을 각각 확인한다. DPAPI 재개 데이터는 같은 Windows 사용자에서 생성·재시작하는 새 테스트 데이터로 검증한다.
+5. 앞 절의 RunStage5 명령을 구성별로 순차 실행해 기존 94×2개와 모든 신규 항목을 모두 통과시킨다. 실행 차단과 기능 실패를 구분하며 차단 시 동일 빌드 실행을 반복하지 않는다. JSON/로그와 4GiB 실전송·경계 시뮬레이션·자원 측정을 구분하여 기록한다.
+6. 모두 통과한 결과를 확보하고 이후 별도 사용자 지시가 있을 때에만 main 비교·병합, 충돌 없는 일반 push와 원격 커밋 확인을 진행한다. 앞선 최종 검증 시도는 조건을 충족하지 못하여 커밋·병합·push하지 않았다. 이후 사용자가 안정화 수정의 **로컬 보존 커밋만** 명시적으로 요청했으므로 아래 보존 작업을 수행한다. main 병합 및 원격 push는 계속 금지한다.
+
+### 안정화 수정의 후속 로컬 보존
+
+`feature/stage5-recovery`에서 Network.h, Network.cpp, stage5_boundaries.ps1, 이 문서의 4개 변경을 검토하여 최초 보존 커밋 `32391b3` 위에 로컬 커밋한다. 커밋 메시지에 **final validation incomplete**를 명시한다. 이번 작업에서는 새 기능·빌드·테스트 실행·보안 정책 변경을 수행하지 않았으며 위 테스트 수와 SAC 차단 기록을 그대로 유지한다. 커밋은 검증 완료 선언이 아니다.
+
+소스 변경은 승인/거절 발행과 재접속의 직렬화 및 유효한 승인 시에만 응답 큐를 가져오도록 하는 안정화다. 테스트 변경은 양방향 승인 완료 후 청크 중계를 멈추는 순서 수정이다. 로그·이벤트 XML·빌드 산출물·대용량 데이터와 인증 정보는 포함하지 않고 기존 `.gitignore`와 제외된 로컬 자료를 유지한다. main=`b87ff47`과 기존 커밋 이력을 보존하고 원격 push/병합/변경 폐기를 하지 않는다. 최종 검증 명령과 환경 요구 사항은 앞 절의 빌드 명령 및 RunStage5 명령을 그대로 사용한다.

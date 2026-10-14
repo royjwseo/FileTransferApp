@@ -75,10 +75,16 @@ try {
     Pass '4GiB+1 resume offset with real prefix hashing and 65535-byte tail TCP (raw-peer boundary simulation)'
 } finally { $c.Peer.Dispose(); $c.App.Dispose(); Remove-Item -LiteralPath $source }
 $source = Join-Path $runDir 'duplex-cancel.bin'; [Stage4Data]::Sparse($source,8MB); Record-SourceHash $source
-$pair = New-Pair 'duplex-one-cancel' 'pause-chunks'
+$pair = New-Pair 'duplex-one-cancel'
 try {
+    # Complete both approvals before pausing data. Pausing the first stream
+    # earlier would also trap the second ACCEPT behind that stream's bytes.
+    $pair.Relay.ChunkDelayMs = 5
     Start-Transfer $pair.ClientApp $pair.HostApp $source
     Start-Transfer $pair.HostApp $pair.ClientApp $source
+    $pair.ClientApp.WaitText('Sending: file=duplex-cancel.bin')
+    $pair.HostApp.WaitText('Sending: file=duplex-cancel.bin')
+    $pair.Relay.PauseChunks = $true
     Assert ($pair.Relay.WaitChunk(5000)) 'No paused chunk'
     $pair.ClientApp.Send('/cancel 2'); $pair.ClientApp.WaitText('[Transfer cancelled]')
     $pair.Relay.ReleaseChunks()
