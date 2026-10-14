@@ -229,12 +229,28 @@ struct Window {
     int Scale(int n) const {return MulDiv(n,dpi,96);}
     void Layout() {
         if(!Get(Ip))return;
-        RECT r{};GetClientRect(hwnd,&r);int w=MulDiv(r.right,96,dpi),h=MulDiv(r.bottom,96,dpi);int top=legacy?0:225;h-=top;
-        const int extra=std::max(0,h-795),width=w-40;
+        RECT r{};GetClientRect(hwnd,&r);int top=legacy?0:225;
         SCROLLINFO si{sizeof(si),SIF_RANGE|SIF_PAGE|SIF_POS};si.nMax=Scale(795+top)-1;si.nPage=r.bottom;si.nPos=scrollY;SetScrollInfo(hwnd,SB_VERT,&si,TRUE);si.fMask=SIF_POS;GetScrollInfo(hwnd,SB_VERT,&si);scrollY=si.nPos;
-        auto move=[&](int id,int x,int y,int cw,int ch){MoveWindow(Get(id),Scale(x),Scale(y+top)-scrollY,Scale(cw),Scale(ch),TRUE);};
+        // SetScrollInfo can show/hide the bar and change the client width.
+        GetClientRect(hwnd,&r);
+        int w=MulDiv(r.right,96,dpi),h=MulDiv(r.bottom,96,dpi)-top;
+        const int extra=std::max(0,h-795),width=w-40;
+        HRGN dirty=CreateRectRgn(0,0,0,0);
+        auto place=[&](int id,int x,int y,int cw,int ch){
+            HWND child=Get(id);RECT before{};GetWindowRect(child,&before);
+            MapWindowPoints(HWND_DESKTOP,hwnd,reinterpret_cast<POINT*>(&before),2);
+            RECT after{Scale(x),Scale(y)-scrollY,Scale(x)+Scale(cw),Scale(y)-scrollY+Scale(ch)};
+            if(EqualRect(&before,&after))return;
+            // Do not paint a partially moved set of overlapping sibling controls.
+            SetWindowPos(child,nullptr,after.left,after.top,after.right-after.left,after.bottom-after.top,
+                SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW);
+            if(IsWindowVisible(child))for(const RECT& area:{before,after}){
+                HRGN part=CreateRectRgnIndirect(&area);CombineRgn(dirty,dirty,part,RGN_OR);DeleteObject(part);
+            }
+        };
+        auto move=[&](int id,int x,int y,int cw,int ch){place(id,x,y+top,cw,ch);};
         if(!legacy){
-            auto lane=[&](int id,int x,int y,int cw,int ch){MoveWindow(Get(id),Scale(x),Scale(y)-scrollY,Scale(cw),Scale(ch),TRUE);};
+            auto lane=[&](int id,int x,int y,int cw,int ch){place(id,x,y,cw,ch);};
             lane(LanGroup,10,5,w-20,215);lane(Devices,25,28,w-210,83);lane(RefreshDevices,w-175,28,145,29);lane(RequestConnect,w-175,66,145,29);
             lane(LanStatus,25,115,w-50,26);lane(ConsentText,25,148,w-250,45);lane(ConsentAccept,w-215,153,90,30);lane(ConsentReject,w-115,153,90,30);
             lane(DirectConsent,280,254,150,29);
@@ -248,6 +264,10 @@ struct Window {
         int p=538+extra;move(ProgressGroup,10,p,w-20,247);move(CancelSend,25,p+25,105,29);move(CancelReceive,140,p+25,105,29);
         move(SendProgress,25,p+64,width,18);move(SendDetails,25,p+86,width,43);move(ReceiveProgress,25,p+132,width,18);move(ReceiveDetails,25,p+154,width,43);
         move(TransferId,25,p+205,w-270,28);move(Resume,w-235,p+205,100,29);move(Query,w-125,p+205,100,29);
+        // Erase vacated parent pixels and invalidate every intersecting sibling,
+        // including group boxes. Normal WM_PAINT processing coalesces rapid input.
+        RedrawWindow(hwnd,nullptr,dirty,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN);
+        DeleteObject(dirty);
     }
     void Font() {
         HFONT next=CreateFontW(-Scale(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Segoe UI");
@@ -300,7 +320,7 @@ struct Window {
         DragAcceptFiles(hwnd,TRUE); SetTimer(hwnd,1,50,nullptr);
         controller=std::make_unique<Controller>(events,legacy);
         for(int id:{LanGroup,Devices,RefreshDevices,RequestConnect,DirectConsent,ConsentText,ConsentAccept,ConsentReject,LanStatus})ShowWindow(Get(id),legacy?SW_HIDE:SW_SHOW);
-        if(!legacy){for(int id:{Host,Connect,Reconnect})ShowWindow(Get(id),SW_HIDE);SetWindowPos(Get(Disconnect),nullptr,Scale(475),Scale(254),Scale(100),Scale(29),SWP_NOZORDER);}
+        if(!legacy){for(int id:{Host,Connect,Reconnect})ShowWindow(Get(id),SW_HIDE);}
     }
     void Select(std::wstring file) {
         path=std::move(file);selectedValid=false;Set(Selected,L"파일 정보 확인 중...");
@@ -390,11 +410,25 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
     try {
         switch(message){
         case WM_CREATE:window->Create();return 0;
-        case WM_SIZE:window->Layout();return 0;
-        case WM_VSCROLL:{SCROLLINFO si{sizeof(si),SIF_ALL};GetScrollInfo(hwnd,SB_VERT,&si);int pos=si.nPos;switch(LOWORD(w)){case SB_LINEUP:pos-=window->Scale(25);break;case SB_LINEDOWN:pos+=window->Scale(25);break;case SB_PAGEUP:pos-=si.nPage;break;case SB_PAGEDOWN:pos+=si.nPage;break;case SB_THUMBTRACK:pos=si.nTrackPos;break;}window->scrollY=std::max(0,pos);window->Layout();return 0;}
+        case WM_SIZE:if(w!=SIZE_MINIMIZED)window->Layout();return 0;
+        case WM_VSCROLL:{
+            SCROLLINFO si{sizeof(si),SIF_ALL};GetScrollInfo(hwnd,SB_VERT,&si);
+            int pos=si.nPos;
+            switch(LOWORD(w)){
+            case SB_LINEUP:pos-=window->Scale(25);break;
+            case SB_LINEDOWN:pos+=window->Scale(25);break;
+            case SB_PAGEUP:pos-=si.nPage;break;
+            case SB_PAGEDOWN:pos+=si.nPage;break;
+            case SB_TOP:pos=si.nMin;break;
+            case SB_BOTTOM:pos=si.nMax;break;
+            case SB_THUMBPOSITION:case SB_THUMBTRACK:pos=si.nTrackPos;break;
+            default:return 0;
+            }
+            window->scrollY=std::max(0,pos);window->Layout();return 0;
+        }
         case WM_MOUSEWHEEL:window->scrollY=std::max(0,window->scrollY-MulDiv(GET_WHEEL_DELTA_WPARAM(w),window->Scale(60),WHEEL_DELTA));window->Layout();return 0;
         case WM_GETMINMAXINFO:{auto* limits=reinterpret_cast<MINMAXINFO*>(l);limits->ptMinTrackSize={window->Scale(850),window->Scale(450)};return 0;}
-        case WM_DPICHANGED:{window->dpi=HIWORD(w);window->Font();auto* r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);window->Layout();return 0;}
+        case WM_DPICHANGED:{window->scrollY=MulDiv(window->scrollY,HIWORD(w),window->dpi);window->dpi=HIWORD(w);window->Font();auto* r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);window->Layout();return 0;}
         case WM_COMMAND:if(HIWORD(w)==BN_CLICKED)window->CommandClick(LOWORD(w));return 0;
         case WM_TIMER:window->Tick();return 0;
         case WM_DROPFILES:{HDROP drop=reinterpret_cast<HDROP>(w);struct DropOwner{HDROP value;~DropOwner(){DragFinish(value);}} owner{drop};if(DragQueryFileW(drop,0xffffffff,nullptr,0)==1&&!window->closing){UINT size=DragQueryFileW(drop,0,nullptr,0);if(size>32768){window->Log(L"파일 경로가 너무 깁니다.");return 0;}std::wstring path(size+1,L'\0');DragQueryFileW(drop,0,path.data(),size+1);path.resize(size);window->Select(std::move(path));}else window->Log(L"한 번에 파일 하나를 놓으세요.");return 0;}
