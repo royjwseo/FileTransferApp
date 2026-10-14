@@ -9,6 +9,9 @@
 #include <fstream>
 #include <array>
 #include <algorithm>
+#ifdef FILETRANSFER_TESTING
+#include "../../tests/Stage4Faults.h"
+#endif
 
 
 Network::~Network()
@@ -133,7 +136,7 @@ void Network::ReceiveLoop()
 {
     try
     {
-        char buffer[1024];
+        std::array<char, FileTransfer::CHUNK_SIZE> buffer;
 
         while (true)
         {
@@ -143,23 +146,26 @@ void Network::ReceiveLoop()
                 std::lock_guard<std::mutex> ioLock(receiveMutex_);
                 const SOCKET connected = ConnectedSocket();
                 if (connected == INVALID_SOCKET) break;
-                n = recv(connected, buffer, sizeof(buffer), 0);
+                n = recv(connected, buffer.data(), static_cast<int>(buffer.size()), 0);
                 if (n == SOCKET_ERROR) receiveError = WSAGetLastError();
             }
 
             if (n > 0)
             {
                 bool valid;
+                std::optional<FileTransfer::Progress> progress;
                 std::vector<Protocol::Reply> replies;
                 {
                     std::lock_guard<std::mutex> lock(protocolMutex_);
                     // Expire requests before processing new bytes as well as
                     // on recv timeouts: continuous text cannot prevent expiry.
                     protocol_.CheckTimeouts();
-                    valid = protocol_.Feed(std::string_view(buffer, static_cast<size_t>(n)));
+                    valid = protocol_.Feed(std::string_view(buffer.data(), static_cast<size_t>(n)));
+                    progress = protocol_.TakeProgress();
                     replies = protocol_.TakeReplies();
                 }
                 approvalCv_.notify_all();
+                if (progress) FileTransfer::Print(*progress);
                 if (!SendReplies(std::move(replies))) break;
                 if (!valid)
                 {
@@ -238,9 +244,14 @@ SOCKET Network::ConnectedSocket()
 
 bool Network::AdoptSocket(SOCKET connected, bool host)
 {
+    const int socketBufferBytes = 64 * 1024;
     const DWORD receiveTimeoutMs = 250;
     const DWORD sendTimeoutMs = 2000;
-    if (setsockopt(connected, SOL_SOCKET, SO_RCVTIMEO,
+    if (setsockopt(connected, SOL_SOCKET, SO_SNDBUF,
+        reinterpret_cast<const char*>(&socketBufferBytes), sizeof(socketBufferBytes)) == SOCKET_ERROR ||
+        setsockopt(connected, SOL_SOCKET, SO_RCVBUF,
+        reinterpret_cast<const char*>(&socketBufferBytes), sizeof(socketBufferBytes)) == SOCKET_ERROR ||
+        setsockopt(connected, SOL_SOCKET, SO_RCVTIMEO,
         reinterpret_cast<const char*>(&receiveTimeoutMs), sizeof(receiveTimeoutMs)) == SOCKET_ERROR ||
         setsockopt(connected, SOL_SOCKET, SO_SNDTIMEO,
         reinterpret_cast<const char*>(&sendTimeoutMs), sizeof(sendTimeoutMs)) == SOCKET_ERROR)
@@ -263,63 +274,63 @@ bool Network::AdoptSocket(SOCKET connected, bool host)
     return true;
 }
 
-bool Network::SendFrame(
-    MessageType type,
-    std::string_view payload)
+bool Network::SendFrame(MessageType type, std::string_view payload)
 {
+    return SendParts(type, 0, payload);
+}
+
+bool Network::SendParts(MessageType type, uint64_t id, std::string_view payload)
+{
+    if (payload.size() > Protocol::MAX_PAYLOAD - (id ? 8 : 0)) return false;
+    std::array<char, 13> prefix{};
+    const uint32_t length = static_cast<uint32_t>(payload.size() + (id ? 8 : 0));
+    prefix[0] = static_cast<char>(type);
+    for (int i = 0; i < 4; ++i) prefix[1 + i] = static_cast<char>(length >> ((3 - i) * 8));
+    if (id) for (int i = 0; i < 8; ++i) prefix[5 + i] = static_cast<char>(id >> ((7 - i) * 8));
+    const size_t prefixSize = id ? 13 : 5;
+    const size_t totalSize = prefixSize + payload.size();
     std::lock_guard<std::mutex> lock(sendMutex_);
-
     const SOCKET connected = ConnectedSocket();
-    if (connected == INVALID_SOCKET)
-        return false;
-
-    std::vector<char> frame;
-
-    try
+    if (connected == INVALID_SOCKET) return false;
+    size_t offset = 0;
+    while (offset < totalSize)
     {
-        frame = Protocol::MakeFrame(type, payload);
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-        return false;
-    }
-
-    size_t total = 0;
-
-    while (total < frame.size())
-    {
-        int remaining = static_cast<int>(
-            frame.size() - total);
-
-        int n = send(
-            connected,
-            frame.data() + total,
-            remaining,
-            0);
-
-        if (n == SOCKET_ERROR || n == 0)
+        WSABUF parts[2]{};
+        DWORD count = 0;
+        if (offset < prefixSize)
         {
-            std::cerr << "send failed: "
-                << WSAGetLastError() << '\n';
+            parts[count++] = { static_cast<ULONG>(prefixSize - offset), prefix.data() + offset };
+            if (!payload.empty()) parts[count++] = {
+                static_cast<ULONG>(payload.size()), const_cast<char*>(payload.data()) };
+        }
+        else parts[count++] = { static_cast<ULONG>(totalSize - offset),
+            const_cast<char*>(payload.data()) + (offset - prefixSize) };
+#ifdef FILETRANSFER_TESTING
+        // Force multiple actual socket writes, including a split header/ID.
+        const auto slice = Stage4Faults::Value("FTA_TEST_SEND_SLICE", UINT64_MAX);
+        if (slice < parts[0].len) { parts[0].len = static_cast<ULONG>(slice); count = 1; }
+        else if (count == 2 && slice < uint64_t(parts[0].len) + parts[1].len)
+            parts[1].len = static_cast<ULONG>(slice - parts[0].len);
+#endif
+        DWORD sent = 0;
+        if (WSASend(connected, parts, count, &sent, 0, nullptr, nullptr) == SOCKET_ERROR ||
+            sent == 0 || sent > totalSize - offset)
+        {
+            std::cerr << "send failed: " << WSAGetLastError() << '\n';
             RequestStop();
             return false;
         }
-
-        total += static_cast<size_t>(n);
+        offset += sent;
     }
-
     return true;
 }
-
-
 bool Network::SendFile(const std::string& path)
 {
     std::lock_guard<std::mutex> fileLock(fileSendMutex_);
 
     namespace fs = std::filesystem;
 
-    constexpr size_t CHUNK_SIZE = 64 * 1024;
+    constexpr size_t CHUNK_SIZE = FileTransfer::CHUNK_SIZE;
 
     std::error_code ec;
     fs::path filePath(path);
@@ -330,7 +341,7 @@ bool Network::SendFile(const std::string& path)
         return false;
     }
 
-    uintmax_t fileSize = fs::file_size(filePath, ec);
+    const uint64_t fileSize = fs::file_size(filePath, ec);
 
     if (ec || fileSize > Protocol::MAX_FILE_SIZE)
     {
@@ -396,6 +407,9 @@ bool Network::SendFile(const std::string& path)
     if (!SendFrame(MessageType::FileBegin, identifiedMetadata)) return false;
     std::array<char, CHUNK_SIZE> buffer;
     uint64_t sentBytes = 0;
+    FileTransfer progress;
+    progress.Start(fileName, id, fileSize, true);
+    FileTransfer::Print(*progress.Update(0, true));
 
     while (sentBytes < fileSize)
     {
@@ -403,7 +417,10 @@ bool Network::SendFile(const std::string& path)
             std::min<uint64_t>(
                 CHUNK_SIZE, fileSize - sentBytes));
 
-        file.read(buffer.data(), toRead);
+#ifdef FILETRANSFER_TESTING
+        if (Stage4Faults::Fail("FTA_TEST_READ_FAIL_AFTER", sentBytes)) file.setstate(std::ios::badbit);
+#endif
+        file.read(buffer.data(), static_cast<std::streamsize>(toRead));
 
         std::streamsize bytesRead = file.gcount();
 
@@ -428,14 +445,12 @@ bool Network::SendFile(const std::string& path)
         }
         // Never hold the state lock during socket I/O: the peer may be sending
         // concurrently and needs our receiver to drain the other direction.
-        if (!SendFrame(MessageType::FileChunk, Protocol::WithRequestId(id, chunk)))
+        if (!SendParts(MessageType::FileChunk, id, chunk))
             return false;
 
         sentBytes += static_cast<uint64_t>(bytesRead);
 
-        std::cout << "\rSending: "
-            << sentBytes << "/" << fileSize
-            << " bytes" << std::flush;
+        if (auto p = progress.Update(sentBytes)) FileTransfer::Print(*p);
     }
 
     {
@@ -444,6 +459,7 @@ bool Network::SendFile(const std::string& path)
         std::lock_guard<std::mutex> lock(protocolMutex_);
         if (approvalCancelled_ || !protocol_.AwaitAck()) return false;
     }
+    if (sentBytes != 0) FileTransfer::Print(*progress.Update(sentBytes, true));
     if (!SendFrame(MessageType::FileEnd, Protocol::WithRequestId(id))) return false;
     std::cout << "\n[Upload finished, waiting for ACK] " << fileName << '\n' << std::flush;
     if (!WaitForState(Protocol::SendState::AwaitAck, Protocol::TRANSFER_TIMEOUT)) return false;

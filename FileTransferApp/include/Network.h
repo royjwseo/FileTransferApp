@@ -45,6 +45,7 @@ private:
     bool SendFrame(
         MessageType type,
         std::string_view payload);
+    bool SendParts(MessageType type, uint64_t id, std::string_view payload);
 
     SOCKET socket_ = INVALID_SOCKET;
     bool stopping_ = true;

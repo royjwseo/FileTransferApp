@@ -55,7 +55,7 @@ foreach ($mode in @('unapproved','pending','rejected','wrong-name','wrong-size',
             'wrong-name' { $meta = Metadata 10 'different.txt' }
             'wrong-size' { $meta = Metadata 11 'approved.txt' }
             'truncated' { $meta = [byte[]]@(0,1,2) }
-            'over-limit' { $meta = Metadata (100MB+1) 'approved.txt' }
+            'over-limit' { $meta = Metadata ([UInt64]1099511627777) 'approved.txt' }
             'traversal' { $meta = Metadata 10 '../escape.txt' }
             'reserved' { $meta = Metadata 10 'CON.txt' }
             'trailing-dot' { $meta = Metadata 10 'approved.' }

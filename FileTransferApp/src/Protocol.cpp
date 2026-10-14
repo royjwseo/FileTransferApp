@@ -11,6 +11,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <system_error>
+#ifdef FILETRANSFER_TESTING
+#include "../../tests/Stage4Faults.h"
+#endif
 
 namespace fs = std::filesystem;
 
@@ -198,55 +201,42 @@ void Protocol::CheckTimeouts()
     }
 }
 
-bool Protocol::Feed(std::string_view bytes)
+std::optional<FileTransfer::Progress> Protocol::TakeProgress()
 {
-    buffer_.insert(
-        buffer_.end(), bytes.begin(), bytes.end());
-
-    size_t offset = 0;
-
-    while (buffer_.size() - offset >= HEADER_SIZE)
-    {
-        const auto* p =
-            reinterpret_cast<const unsigned char*>(
-                buffer_.data() + offset);
-
-        MessageType type = static_cast<MessageType>(p[0]);
-
-        uint32_t length =
-            (uint32_t(p[1]) << 24) |
-            (uint32_t(p[2]) << 16) |
-            (uint32_t(p[3]) << 8) |
-            uint32_t(p[4]);
-
-        if (length > MAX_PAYLOAD)
-            return false;
-
-        size_t frameSize = HEADER_SIZE + size_t(length);
-
-        if (buffer_.size() - offset < frameSize)
-            break;
-
-        std::string_view payload(
-            buffer_.data() + offset + HEADER_SIZE,
-            length);
-
-        if (!ProcessMessage(type, payload))
-            return false;
-
-        offset += frameSize;
-    }
-
-    if (offset > 0)
-    {
-        buffer_.erase(
-            buffer_.begin(),
-            buffer_.begin() + offset);
-    }
-
-    return true;
+    auto result = std::move(pendingProgress_);
+    pendingProgress_.reset();
+    return result;
 }
 
+bool Protocol::Feed(std::string_view bytes)
+{
+    // Accumulate exactly one frame; even a caller supplying many frames cannot
+    // grow the buffer with the complete input. Capacity is reserved only once.
+    if (buffer_.capacity() < MAX_BUFFER_SIZE) buffer_.reserve(MAX_BUFFER_SIZE);
+    while (!bytes.empty())
+    {
+        if (buffer_.size() < HEADER_SIZE)
+        {
+            const auto n = std::min(HEADER_SIZE - buffer_.size(), bytes.size());
+            buffer_.insert(buffer_.end(), bytes.begin(), bytes.begin() + n);
+            bytes.remove_prefix(n);
+            if (buffer_.size() < HEADER_SIZE) break;
+        }
+        const auto* p = reinterpret_cast<const unsigned char*>(buffer_.data());
+        const uint32_t length = (uint32_t(p[1]) << 24) | (uint32_t(p[2]) << 16) |
+            (uint32_t(p[3]) << 8) | uint32_t(p[4]);
+        if (length > MAX_PAYLOAD) return false;
+        const size_t frameSize = HEADER_SIZE + size_t(length);
+        const auto n = std::min(frameSize - buffer_.size(), bytes.size());
+        buffer_.insert(buffer_.end(), bytes.begin(), bytes.begin() + n);
+        bytes.remove_prefix(n);
+        if (buffer_.size() < frameSize) break;
+        if (!ProcessMessage(static_cast<MessageType>(p[0]),
+            std::string_view(buffer_.data() + HEADER_SIZE, length))) return false;
+        buffer_.clear();
+    }
+    return true;
+}
 bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
 {
     if (type == MessageType::Text)
@@ -417,6 +407,13 @@ bool Protocol::BeginFile(std::string_view payload)
         return FailFile("Cannot inspect destination");
     if (fs::exists(finalStatus)) return FailFile("Destination already exists");
 
+    ULARGE_INTEGER available{};
+    if (!GetDiskFreeSpaceExW(folder.c_str(), &available, nullptr, nullptr))
+        return FailFile("Cannot inspect available disk space");
+#ifdef FILETRANSFER_TESTING
+    available.QuadPart = Stage4Faults::Value("FTA_TEST_FREE_BYTES", available.QuadPart);
+#endif
+    if (fileSize > available.QuadPart) return FailFile("Insufficient disk space");
     // CREATE_NEW atomically refuses existing files/links, including .part files.
     HANDLE created = CreateFileW(tempPath_.c_str(), GENERIC_WRITE | DELETE,
         0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -427,6 +424,8 @@ bool Protocol::BeginFile(std::string_view payload)
     expectedSize_ = fileSize;
     receivedSize_ = 0;
     receivingFile_ = true;
+    receiveProgress_.Start(fileName, incomingId_, expectedSize_, false);
+    pendingProgress_ = receiveProgress_.Update(0, true);
     std::cout << "\n[Receiving] " << fileName
         << " (" << expectedSize_ << " bytes)\n" << std::flush;
     return true;
@@ -438,18 +437,36 @@ bool Protocol::WriteFileChunk(std::string_view payload)
         return FailFile("File data received without active approved transfer");
     if (receivedSize_ > expectedSize_ || payload.size() > expectedSize_ - receivedSize_)
         return FailFile("File data exceeds approved size");
-    DWORD written = 0;
-    if (!WriteFile(file_, payload.data(), static_cast<DWORD>(payload.size()), &written, nullptr) ||
-        written != payload.size())
-        return FailFile("File write failed");
-    receivedSize_ += written;
-    return true;
+    size_t offset = 0;
+    while (offset < payload.size())
+    {
+        DWORD count = static_cast<DWORD>(payload.size() - offset);
+#ifdef FILETRANSFER_TESTING
+        if (Stage4Faults::Fail("FTA_TEST_WRITE_FAIL_AFTER", receivedSize_))
+        {
+            SetLastError(ERROR_DISK_FULL);
+            return FailFile("File write failed");
+        }
+        count = static_cast<DWORD>(std::min<uint64_t>(count,
+            Stage4Faults::Value("FTA_TEST_WRITE_SLICE", count)));
+#endif
+        DWORD written = 0;
+        if (!WriteFile(file_, payload.data() + offset, count, &written, nullptr) ||
+            written == 0 || written > count) return FailFile("File write failed");
+        offset += written;
+        receivedSize_ += written; // subtraction check above proves no overflow.
+    }
+    if (auto p = receiveProgress_.Update(receivedSize_)) pendingProgress_ = std::move(p);    return true;
 }
 
 bool Protocol::EndFile()
 {
     if (!receivingFile_ || !file_ || !ownsTemp_ || receivedSize_ != expectedSize_)
         return FailFile("File ended without matching approved size");
+    pendingProgress_ = receiveProgress_.Update(receivedSize_, true);
+#ifdef FILETRANSFER_TESTING
+    if (Stage4Faults::Value("FTA_TEST_FLUSH_FAIL", 0)) return FailFile("File flush failed");
+#endif
     if (!FlushFileBuffers(file_)) return FailFile("File flush failed");
 
     // Rename the owned handle atomically, with no replacement of a destination
@@ -522,6 +539,7 @@ void Protocol::ResetConnection()
 {
     ClearIncoming();
     if (sendState_ != SendState::Completed) sendState_ = SendState::Failed;
+    pendingProgress_.reset();
     replies_.clear();
     buffer_.clear();
 }

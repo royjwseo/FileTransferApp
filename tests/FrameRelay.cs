@@ -19,6 +19,7 @@ public sealed class FrameRelay : IDisposable {
     readonly ManualResetEventSlim chunkGate = new ManualResetEventSlim(false);
     volatile bool stopped;
     public volatile bool DropAck, HoldAck, PauseChunks;
+    public volatile int ChunkDelayMs, FragmentSize;
     byte[] lastAck;
     TcpClient ackTarget;
     object ackWrite;
@@ -78,7 +79,12 @@ public sealed class FrameRelay : IDisposable {
                     if (HoldAck) ackGate.Wait();
                 }
                 if (stopped) return;
-                lock(writeLock) { target.GetStream().Write(frame, 0, frame.Length); }
+                if (header[0] == 3 && ChunkDelayMs > 0) Thread.Sleep(ChunkDelayMs);
+                lock(writeLock) {
+                    int fragment = FragmentSize > 0 ? FragmentSize : frame.Length;
+                    for (int offset = 0; offset < frame.Length; offset += fragment)
+                        target.GetStream().Write(frame, offset, Math.Min(fragment, frame.Length - offset));
+                }
             }
         } catch (IOException) { Cut(); }
           catch (SocketException) { Cut(); }

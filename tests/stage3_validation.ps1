@@ -1,4 +1,5 @@
-﻿param([string]$Exe = "$PSScriptRoot/../x64/Release/FileTransferApp.exe",[switch]$AckCloseOnly)
+﻿param([string]$Exe = "$PSScriptRoot/../x64/Release/FileTransferApp.exe",[switch]$AckCloseOnly,[switch]$HelpersOnly)
+$validationHelpersOnly = $HelpersOnly.IsPresent
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/stage1.ps1" -Exe $Exe -HelpersOnly
 Add-Type -Path "$PSScriptRoot/FrameRelay.cs"
@@ -30,18 +31,21 @@ function Assert-Hash([string]$source,[string]$saved) {
     Assert ((Get-FileHash -LiteralPath $saved -Algorithm SHA256).Hash -eq $before) 'SHA-256 mismatch'
     Assert (!(Test-Path -LiteralPath ($saved + '.part'))) 'Committed file retained part'
 }
-function New-Pair([string]$name,[string]$fault = '') {
+function New-Pair([string]$name,[string]$fault = '',[switch]$Direct) {
     $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
     $probe.Start(); $port = $probe.LocalEndpoint.Port; $probe.Stop()
     $hostApp = $null; $clientApp = $null; $relay = $null
     try {
         $hostApp = New-App ($name + '-host') "--host --bind 127.0.0.1 --port $port"
         $hostApp.WaitText('Waiting for connection on port')
-        $relay = [FrameRelay]::new($port)
-        $relay.HoldAck = $fault -eq 'hold-ack'
-        $relay.DropAck = $fault -eq 'drop-ack'
-        $relay.PauseChunks = $fault -eq 'pause-chunks'
-        $clientApp = New-App ($name + '-client') ("--connect 127.0.0.1 --port " + $relay.Port)
+        if (!$Direct) {
+            $relay = [FrameRelay]::new($port)
+            $relay.HoldAck = $fault -eq 'hold-ack'
+            $relay.DropAck = $fault -eq 'drop-ack'
+            $relay.PauseChunks = $fault -eq 'pause-chunks'
+            $port = $relay.Port
+        }
+        $clientApp = New-App ($name + '-client') ("--connect 127.0.0.1 --port " + $port)
         $hostApp.WaitText('Commands:'); $clientApp.WaitText('Commands:')
         return @{ HostApp=$hostApp; ClientApp=$clientApp; Relay=$relay; Name=$name; InstanceId=[Guid]::NewGuid().ToString('N') }
     } catch {
@@ -59,16 +63,17 @@ function Save-Pair($pair) {
             [IO.File]::WriteAllText((Join-Path $runDir $logName),$app.Output)
         }
     } finally {
-        $pair.Relay.Dispose(); $pair.HostApp.Dispose(); $pair.ClientApp.Dispose()
+        if ($pair.Relay) { $pair.Relay.Dispose() }
+        $pair.HostApp.Dispose(); $pair.ClientApp.Dispose()
     }
 }
 function Stop-Pair($pair) {
     $pair.HostApp.Send('/quit'); $pair.ClientApp.Send('/quit')
     $pair.HostApp.WaitExit(); $pair.ClientApp.WaitExit()
 }
-function Start-Transfer($sender,$receiver,[string]$path) {
+function Start-Transfer($sender,$receiver,[string]$path,[switch]$SkipHash) {
     $name = [IO.Path]::GetFileName($path)
-    Record-SourceHash $path
+    if (!$SkipHash) { Record-SourceHash $path }
     $sender.Send('/file "' + $path + '"')
     $receiver.WaitText('[Incoming file request] ' + $name)
     $receiver.Send('/accept')
@@ -76,6 +81,8 @@ function Start-Transfer($sender,$receiver,[string]$path) {
 function Saved-Path($app,[string]$name) {
     return Join-Path $app.Process.StartInfo.WorkingDirectory ('received/' + $name)
 }
+
+if ($validationHelpersOnly) { return }
 
 # A valid ACK followed immediately by FIN must not race cancellation and undo
 # already confirmed storage. Repeated real process runs exercise the scheduling.
@@ -123,7 +130,7 @@ foreach ($arguments in @('--help','--version')) {
     $app = New-App ([Guid]::NewGuid().ToString('N')) $arguments
     try {
         $app.WaitExit()
-        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=3 requestId64-parity')) 'Missing protocol version' }
+        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=4 requestId64-parity')) 'Missing protocol version' }
         else { Assert ($app.Output.Contains('--host')) 'Missing usage' }
     } finally { $app.Dispose() }
 }
@@ -138,7 +145,7 @@ try {
     Pass 'custom loopback bind and ports; CLI preserves the first stdin command'
 } finally { Save-Pair $pair }
 
-# Random data in bounded chunks; exactly the supported 100 MiB file-size limit.
+# Random data in bounded chunks; 100 MiB regression for the former file-size limit.
 $large = Join-Path $runDir 'large-100MiB.bin'
 $stream = [IO.File]::Create($large)
 try {
@@ -158,7 +165,7 @@ try {
     $pair.ClientApp.WaitText('[Transfer completed] large-100MiB.bin',30000)
     Assert-Hash $large (Saved-Path $pair.HostApp 'large-100MiB.bin')
     Stop-Pair $pair
-    Pass 'B to A actual applications: 100 MiB boundary save, ACK and SHA-256'
+    Pass 'B to A actual applications: 100 MiB regression save, ACK and SHA-256'
 } finally { Save-Pair $pair }
 
 foreach ($mode in @('hold-ack','drop-ack')) {

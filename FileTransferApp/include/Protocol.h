@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "FileTransfer.h"
 
 enum class MessageType : uint8_t {
     Text = 1, FileBegin = 2, FileChunk = 3, FileEnd = 4, FileAck = 5,
@@ -28,10 +29,11 @@ public:
         uint64_t requestId = 0;
     };
     struct Reply { MessageType type; uint64_t requestId; std::string payload; };
-    static constexpr uint32_t WIRE_VERSION = 3;
+    static constexpr uint32_t WIRE_VERSION = 4;
     static constexpr size_t HEADER_SIZE = 5;
     static constexpr uint32_t MAX_PAYLOAD = 1024 * 1024;
-    static constexpr uint64_t MAX_FILE_SIZE = 100ULL * 1024 * 1024;
+    static constexpr uint64_t MAX_FILE_SIZE = 1ULL << 40; // 1 TiB, includes >4 GiB.
+    static constexpr size_t MAX_BUFFER_SIZE = HEADER_SIZE + MAX_PAYLOAD;
     static constexpr auto APPROVAL_TIMEOUT = std::chrono::seconds(60);
     static constexpr auto TRANSFER_TIMEOUT = std::chrono::seconds(15);
     static std::vector<char> MakeFrame(MessageType type, std::string_view payload);
@@ -48,6 +50,7 @@ public:
     bool Feed(std::string_view bytes);
     void CheckTimeouts();
     std::vector<Reply> TakeReplies();
+    std::optional<FileTransfer::Progress> TakeProgress();
     void ResetConnection();
 private:
     using Clock = std::chrono::steady_clock;
@@ -60,6 +63,8 @@ private:
     Clock::time_point receiveDeadline_{}, sendDeadline_{};
     std::vector<Reply> replies_;
     std::vector<char> buffer_;
+    FileTransfer receiveProgress_;
+    std::optional<FileTransfer::Progress> pendingProgress_;
     // Only handles created by this receiver may be deleted.
     void* file_ = nullptr;
     void* directory_ = nullptr;
