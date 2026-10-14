@@ -301,6 +301,12 @@ SOCKET Network::ConnectedSocket()
     return stopping_ ? INVALID_SOCKET : socket_;
 }
 
+bool Network::AdoptApprovedSocket(SOCKET socket, bool host)
+{
+    u_long blocking = 0;
+    if (!initialized_ || ioctlsocket(socket, FIONBIO, &blocking)) { closesocket(socket); return false; }
+    return AdoptSocket(socket, host);
+}
 bool Network::AdoptSocket(SOCKET connected, bool host)
 {
     const int socketBufferBytes = 64 * 1024;

@@ -30,6 +30,7 @@ public:
     bool StartServer(uint16_t port, const std::string& bindIp = "0.0.0.0");
     bool Connect(const std::string& ip, uint16_t port);
 
+    bool AdoptApprovedSocket(SOCKET socket, bool host); // Consumes a GUI-gated socket.
     bool SendText(const std::string& text);
     void ReceiveLoop();
     // May be called by any worker. Interrupts I/O without closing the handle.

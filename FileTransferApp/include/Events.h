@@ -6,14 +6,16 @@
 #include <mutex>
 #include <vector>
 
+struct DiscoveredPeer {std::string id,name,ip;uint16_t port=0;};
 struct AppEvent {
-    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Download, Log };
+    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Download, Peers, Consent, LanStatus, Log };
     Kind kind = Kind::Log;
     std::string text, name, transferId;
     uint64_t requestId = 0, total = 0;
     uint64_t session = 0;
     bool sending = false;
     FileTransfer::Progress progress;
+    std::vector<DiscoveredPeer> peers;
 };
 
 // No UI references or callbacks. The UI drains at 50ms; progress is coalesced.
@@ -28,9 +30,13 @@ public:
             event.text += " [truncated]";
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        if (event.kind == AppEvent::Kind::Peers) {
+            auto old = std::find_if(queue_.begin(), queue_.end(), [](const AppEvent& e) { return e.kind == AppEvent::Kind::Peers; });
+            if (old != queue_.end()) { *old = std::move(event); return; }
+        }
         if (event.kind == AppEvent::Kind::Progress) {
             auto old = std::find_if(queue_.begin(), queue_.end(), [&](const AppEvent& e) {
-                return e.kind == event.kind && e.sending == event.sending && e.requestId == event.requestId;
+                return e.kind == event.kind && e.sending == event.sending && e.requestId == event.requestId && e.session == event.session;
             });
             if (old != queue_.end()) { *old = std::move(event); return; }
         }

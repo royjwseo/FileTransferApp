@@ -20,7 +20,8 @@ public sealed class GuiDriver : IDisposable {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr hwnd,uint msg,IntPtr w,string l,uint flags,uint timeout,out IntPtr result);
     static string Class(IntPtr h){var b=new StringBuilder(128);GetClassName(h,b,b.Capacity);return b.ToString();}
     public GuiDriver(string exe,string cwd):this(exe,cwd,true) {}
-    public GuiDriver(string exe,string cwd,bool seedSettings){
+    public GuiDriver(string exe,string cwd,bool seedSettings):this(exe,cwd,seedSettings,true) {}
+    public GuiDriver(string exe,string cwd,bool seedSettings,bool legacy){
         Process=new Process {StartInfo=new ProcessStartInfo(exe){WorkingDirectory=cwd,UseShellExecute=false,WindowStyle=ProcessWindowStyle.Hidden}};
         string settings=System.IO.Path.Combine(cwd,"gui-settings.txt");
         Process.StartInfo.EnvironmentVariables["FILETRANSFER_GUI_SETTINGS"]=settings;
@@ -28,6 +29,7 @@ public sealed class GuiDriver : IDisposable {
             string received=System.IO.Path.Combine(cwd,"received");System.IO.Directory.CreateDirectory(received);
             System.IO.File.WriteAllText(settings,received,new UTF8Encoding(false));
         }
+        if(legacy)Process.StartInfo.Arguments="--legacy-cli";else Process.StartInfo.EnvironmentVariables["FILETRANSFER_LAN_PORT"]="0";
         Process.Start();
         var watch=Stopwatch.StartNew();
         while(watch.ElapsedMilliseconds<5000){
@@ -79,6 +81,10 @@ public sealed class GuiDriver : IDisposable {
         SetHandle(edit,path);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);Thread.Sleep(300);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);
         Wait(127,path);
     }
+    public string[] Devices(){IntPtr r;if(SendMessageTimeout(GetDlgItem(Window,134),0x18b,IntPtr.Zero,"",2,1000,out r)==IntPtr.Zero)throw new Exception("List timeout");int count=r.ToInt32();var rows=new string[count];for(int i=0;i<count;i++){var b=new StringBuilder(1024);SendMessageTimeout(GetDlgItem(Window,134),0x189,new IntPtr(i),b,2,1000,out r);rows[i]=b.ToString();}return rows;}
+    public void SelectDevice(int index){IntPtr r;SendMessageTimeout(GetDlgItem(Window,134),0x186,new IntPtr(index),"",2,1000,out r);}
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
+    public static void PreventInheritance(IntPtr handle){if(!SetHandleInformation(handle,1,0))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}
     public void Close(){PostMessage(Window,0x10,IntPtr.Zero,IntPtr.Zero);if(!Process.WaitForExit(7000))throw new Exception("GUI shutdown timed out");if(Process.ExitCode!=0)throw new Exception("GUI exit failure");}
     public void Dispose(){if(!Process.HasExited){Process.Kill();Process.WaitForExit();}Process.Dispose();}
 }
