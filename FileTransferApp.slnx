@@ -3,5 +3,6 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
+  <Project Path="FileTransferApp/FileTransferAppGui.vcxproj" />
   <Project Path="FileTransferApp/FileTransferApp.vcxproj" />
 </Solution>

@@ -20,6 +20,8 @@ public sealed class TestApp : IDisposable {
             Arguments = arguments,
             WorkingDirectory = cwd, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardInput = true, RedirectStandardOutput = true,
+            StandardOutputEncoding = new UTF8Encoding(false, true),
+            StandardErrorEncoding = new UTF8Encoding(false, true),
             RedirectStandardError = true } };
         Process.Start();
         stdout = new Thread(() => Read(Process.StandardOutput));
@@ -32,7 +34,11 @@ public sealed class TestApp : IDisposable {
         while ((c = reader.Read()) != -1) lock(output) output.Append((char)c);
     }
     public string Output { get { lock(output) return output.ToString(); } }
-    public void Send(string line) { Process.StandardInput.WriteLine(line); Process.StandardInput.Flush(); }
+    public void Send(string line) {
+        byte[] bytes = new UTF8Encoding(false, true).GetBytes(line + Environment.NewLine);
+        Process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
+        Process.StandardInput.BaseStream.Flush();
+    }
     public void WaitText(string text, int timeout = 5000) {
         var watch = Stopwatch.StartNew();
         while (watch.ElapsedMilliseconds < timeout) {
@@ -93,15 +99,32 @@ function Read-Frame($peer) {
     $length = ([int]$h[1] -shl 24) -bor ([int]$h[2] -shl 16) -bor ([int]$h[3] -shl 8) -bor [int]$h[4]
     $payload = Read-Exact $stream $length
     [UInt64]$id = 0
-    if ($h[0] -ge 2 -and $h[0] -le 9) {
+    $proof = $null
+    if ($h[0] -ge 2 -and $h[0] -le 11) {
         Assert ($payload.Length -ge 8) 'File message missing request ID'
         $id = Read-U64 $payload
         $payload = [byte[]]@($payload | Select-Object -Skip 8)
-        if ($h[0] -eq 6) { $script:outgoingIds[$peer.GetHashCode()] = $id }
+        if ($h[0] -in @(2,6) -and $payload.Length -ge 137) {
+            $proof = [Text.Encoding]::ASCII.GetString($payload,0,128)
+            $payload = [byte[]]@($payload | Select-Object -Skip 129)
+        }
+        if ($h[0] -eq 6) {
+            $script:outgoingIds[$peer.GetHashCode()] = $id
+            $script:outgoingProofs[$peer.GetHashCode()] = $proof
+        }
+        if ($h[0] -eq 7) { $payload = [byte[]]@() }
+        if ($h[0] -in @(5,11)) { $proof = [Text.Encoding]::ASCII.GetString($payload); $payload = [byte[]]@() }
     }
-    return @{ Type=$h[0]; Payload=$payload; RequestId=$id }
+    return @{ Type=$h[0]; Payload=$payload; RequestId=$id; Proof=$proof }
 }
 $script:outgoingIds = @{}
+$script:outgoingProofs = @{}
+$script:rawDigest = $null
+function SHA256-Bytes([byte[]]$bytes) {
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($hash.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
+    finally { $hash.Dispose() }
+}
 function U64-Bytes([UInt64]$value) {
     [byte[]]$bytes = New-Object byte[] 8
     for ($i = 0; $i -lt 8; $i++) { $bytes[$i] = ($value -shr ((7-$i)*8)) -band 255 }
@@ -113,7 +136,21 @@ function Read-U64([byte[]]$bytes) {
     return $value
 }
 function Write-Frame($peer,[byte]$type,[byte[]]$payload,[UInt64]$RequestId = 0,[switch]$NoId) {
-    if ($type -ge 2 -and $type -le 9 -and !$NoId) {
+    if ($type -ge 2 -and $type -le 11 -and !$NoId) {
+        if ($type -in @(2,6) -and $payload.Length -ge 9) {
+            $digest = if ($script:rawDigest) { $script:rawDigest } elseif ((Read-U64 $payload) -eq 0) { SHA256-Bytes @() } else { '0' * 64 }
+            $identityBytes = [byte[]]([Text.Encoding]::ASCII.GetBytes("FTA5`0") + $payload[0..7] + [Text.Encoding]::ASCII.GetBytes($digest) + $payload[8..($payload.Length-1)])
+            $identity = SHA256-Bytes $identityBytes
+            $payload = [byte[]]([Text.Encoding]::ASCII.GetBytes($identity + $digest) + [byte]0 + $payload)
+        }
+        if ($type -eq 7 -and !$payload.Length) {
+            $payload = [byte[]]((U64-Bytes 0) + [Text.Encoding]::ASCII.GetBytes((SHA256-Bytes @())))
+        }
+        if ($type -in @(5,11) -and !$payload.Length) {
+            $proof = $script:outgoingProofs[$peer.GetHashCode()]
+            if (!$proof) { $proof = '0' * 128 }
+            $payload = [Text.Encoding]::ASCII.GetBytes($proof)
+        }
         if (!$RequestId) {
             if ($type -in @(5,7,8,9) -and $script:outgoingIds.ContainsKey($peer.GetHashCode())) {
                 $RequestId = $script:outgoingIds[$peer.GetHashCode()]
@@ -265,13 +302,10 @@ try {
     }
     Assert (Test-Path $part) 'Expected an active partial file'
     $c.Peer.Close()
-    $watch = [Diagnostics.Stopwatch]::StartNew()
-    while ((Test-Path $part) -and $watch.ElapsedMilliseconds -lt 3000) {
-        Start-Sleep -Milliseconds 10
-    }
-    Assert (!(Test-Path $part)) 'Partial file remained after disconnect'
+    $c.App.WaitText('Peer disconnected.')
+    Assert ((Test-Path $part) -and (Test-Path ($part + '.fta'))) 'Owned resume checkpoint was not retained'
     $c.App.Send('/quit'); $c.App.WaitExit()
-    Pass 'peer disconnect promptly removes approved partial receive'
+    Pass 'peer disconnect closes handles and retains authenticated resume checkpoint (stage5 policy)'
 } finally { $c.Peer.Dispose(); $c.App.Dispose() }
 
 $c = New-RawConnection

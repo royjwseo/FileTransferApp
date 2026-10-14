@@ -1,8 +1,10 @@
 ﻿#define NOMINMAX
 
 #include "Network.h"
+#include "FileName.h"
 
 #include <iostream>
+#include <syncstream>
 #include <stdexcept>
 #include <vector>
 #include <filesystem>
@@ -22,6 +24,19 @@ Network::~Network()
         WSACleanup();
 }
 
+void Network::Event(AppEvent::Kind kind, std::string text, bool sending, uint64_t id, std::string name, std::string transferId)
+{
+    if (!events_) return;
+    AppEvent e; e.kind = kind; e.text = std::move(text); e.sending = sending;
+    e.requestId = id; e.name = std::move(name); e.transferId = std::move(transferId); e.session = eventSession_;
+    events_->Push(std::move(e));
+}
+void Network::Progress(const FileTransfer::Progress& progress)
+{
+    FileTransfer::Print(progress);
+    if (events_) { AppEvent e; e.kind = AppEvent::Kind::Progress; e.progress = progress; e.sending = progress.sending; e.requestId = progress.requestId; e.session = eventSession_; events_->Push(std::move(e)); }
+}
+
 bool Network::Initialize()
 {
     if (initialized_) return true;
@@ -39,6 +54,7 @@ bool Network::Initialize()
 
 bool Network::StartServer(uint16_t port, const std::string& bindIp)
 {
+    endpointHost_ = true; endpointPort_ = port; endpointIp_ = bindIp;
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     if (listenSocket == INVALID_SOCKET)
@@ -60,6 +76,7 @@ bool Network::StartServer(uint16_t port, const std::string& bindIp)
     if (bind(listenSocket, reinterpret_cast<sockaddr*>(&addr),
         sizeof(addr)) == SOCKET_ERROR)
     {
+        Event(AppEvent::Kind::Log, "Failed: cannot bind requested address/port");
         std::cerr << "bind failed: " << WSAGetLastError() << '\n';
         closesocket(listenSocket);
         return false;
@@ -72,9 +89,15 @@ bool Network::StartServer(uint16_t port, const std::string& bindIp)
         return false;
     }
 
-    std::cout << "Waiting for connection on port " << port
+    std::osyncstream(std::cout) << "Waiting for connection on port " << port
         << " (bind " << bindIp << ")...\n" << std::flush;
 
+    if ((reconnectAttempt_ || interruptibleSetup_) && !WaitForSocket(listenSocket, false,
+        std::chrono::seconds(interruptibleSetup_ && !reconnectAttempt_ ? 86400 : 2)))
+    {
+        closesocket(listenSocket);
+        return false;
+    }
     SOCKET accepted = accept(listenSocket, nullptr, nullptr);
 
     closesocket(listenSocket);
@@ -86,12 +109,13 @@ bool Network::StartServer(uint16_t port, const std::string& bindIp)
     }
 
     if (!AdoptSocket(accepted, true)) return false;
-    std::cout << "Client connected.\n";
+    std::osyncstream(std::cout) << "Client connected.\n";
     return true;
 }
 
 bool Network::Connect(const std::string& ip, uint16_t port)
 {
+    endpointHost_ = false; endpointPort_ = port; endpointIp_ = ip;
     SOCKET candidate = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
     if (candidate == INVALID_SOCKET)
@@ -111,16 +135,49 @@ bool Network::Connect(const std::string& ip, uint16_t port)
         return false;
     }
 
-    if (connect(candidate, reinterpret_cast<sockaddr*>(&addr),
-        sizeof(addr)) == SOCKET_ERROR)
+    u_long nonblocking = (reconnectAttempt_ || interruptibleSetup_) ? 1 : 0;
+    if (nonblocking && ioctlsocket(candidate, FIONBIO, &nonblocking) == SOCKET_ERROR)
     {
-        std::cerr << "connect failed: " << WSAGetLastError() << '\n';
         closesocket(candidate);
         return false;
     }
-
+    const int result = connect(candidate, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    if (result == SOCKET_ERROR)
+    {
+        const int error = WSAGetLastError();
+        bool connected = false;
+        if ((reconnectAttempt_ || interruptibleSetup_) && error == WSAEWOULDBLOCK &&
+            WaitForSocket(candidate, true, std::chrono::seconds(2)))
+        {
+            int status = 0, length = sizeof(status);
+            connected = getsockopt(candidate, SOL_SOCKET, SO_ERROR,
+                reinterpret_cast<char*>(&status), &length) == 0 && status == 0;
+        }
+        if (!connected)
+        {
+            std::cerr << "connect failed: " << error << '\n';
+            closesocket(candidate);
+            return false;
+        }
+    }
+    nonblocking = 0;
+    if (ioctlsocket(candidate, FIONBIO, &nonblocking) == SOCKET_ERROR)
+    {
+        closesocket(candidate);
+        return false;
+    }
+    sockaddr_in local{}, remote{};
+    int localSize = sizeof(local), remoteSize = sizeof(remote);
+    if (getsockname(candidate, reinterpret_cast<sockaddr*>(&local), &localSize) != 0 ||
+        getpeername(candidate, reinterpret_cast<sockaddr*>(&remote), &remoteSize) != 0 ||
+        (local.sin_port == remote.sin_port && local.sin_addr.s_addr == remote.sin_addr.s_addr))
+    {
+        std::cerr << "Invalid or self-connected endpoint\n";
+        closesocket(candidate);
+        return false;
+    }
     if (!AdoptSocket(candidate, false)) return false;
-    std::cout << "Connected to " << ip << ':' << port << '\n';
+    std::osyncstream(std::cout) << "Connected to " << ip << ':' << port << '\n';
     return true;
 }
 
@@ -132,7 +189,7 @@ bool Network::SendText(const std::string& text)
 
 
 
-void Network::ReceiveLoop()
+void Network::ReceiveSession()
 {
     try
     {
@@ -165,7 +222,7 @@ void Network::ReceiveLoop()
                     replies = protocol_.TakeReplies();
                 }
                 approvalCv_.notify_all();
-                if (progress) FileTransfer::Print(*progress);
+                if (progress) Progress(*progress);
                 if (!SendReplies(std::move(replies))) break;
                 if (!valid)
                 {
@@ -175,7 +232,8 @@ void Network::ReceiveLoop()
             }
             else if (n == 0)
             {
-                std::cout << "\nPeer disconnected.\n" << std::flush;
+                StopConnection();
+                std::osyncstream(std::cout) << "\nPeer disconnected.\n" << std::flush;
                 break;
             }
             else
@@ -207,12 +265,13 @@ void Network::ReceiveLoop()
     {
         std::cerr << "Receive failed: unknown exception\n";
     }
-    RequestStop();
+    StopConnection();
+    Event(AppEvent::Kind::Connection, "Disconnected");
     std::lock_guard<std::mutex> lock(protocolMutex_);
     protocol_.ResetConnection();
 }
 
-void Network::RequestStop()
+void Network::StopConnection()
 {
     {
         std::lock_guard<std::mutex> lock(socketMutex_);
@@ -225,7 +284,7 @@ void Network::RequestStop()
 
 void Network::Disconnect()
 {
-    RequestStop();
+    StopConnection();
     // Never close a handle while a send/recv still uses it.
     std::scoped_lock ioLock(sendMutex_, receiveMutex_);
     std::lock_guard<std::mutex> lock(socketMutex_);
@@ -242,6 +301,12 @@ SOCKET Network::ConnectedSocket()
     return stopping_ ? INVALID_SOCKET : socket_;
 }
 
+bool Network::AdoptApprovedSocket(SOCKET socket, bool host)
+{
+    u_long blocking = 0;
+    if (!initialized_ || ioctlsocket(socket, FIONBIO, &blocking)) { closesocket(socket); return false; }
+    return AdoptSocket(socket, host);
+}
 bool Network::AdoptSocket(SOCKET connected, bool host)
 {
     const int socketBufferBytes = 64 * 1024;
@@ -262,7 +327,7 @@ bool Network::AdoptSocket(SOCKET connected, bool host)
     }
     // Connection setup is performed before launching workers.
     std::lock_guard<std::mutex> lock(socketMutex_);
-    if (socket_ != INVALID_SOCKET)
+    if (socket_ != INVALID_SOCKET || userStopping_)
     {
         closesocket(connected);
         return false;
@@ -271,6 +336,10 @@ bool Network::AdoptSocket(SOCKET connected, bool host)
     stopping_ = false;
     protocol_.Configure(host);
     approvalCancelled_ = false;
+    sockaddr_in peer{}; int size = sizeof(peer); char ip[INET_ADDRSTRLEN]{};
+    if (getpeername(connected, reinterpret_cast<sockaddr*>(&peer), &size) == 0)
+        inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof(ip));
+    Event(AppEvent::Kind::Connection, std::string("Connected: ") + ip);
     return true;
 }
 
@@ -317,161 +386,134 @@ bool Network::SendParts(MessageType type, uint64_t id, std::string_view payload)
             sent == 0 || sent > totalSize - offset)
         {
             std::cerr << "send failed: " << WSAGetLastError() << '\n';
-            RequestStop();
+            StopConnection();
             return false;
         }
         offset += sent;
     }
     return true;
 }
-bool Network::SendFile(const std::string& path)
+uint64_t Network::OutgoingRequestId()
+{
+    std::lock_guard<std::mutex> lock(protocolMutex_);
+    return protocol_.OutgoingId();
+}
+Protocol::SendState Network::OutgoingState()
+{
+    std::lock_guard<std::mutex> lock(protocolMutex_);
+    return protocol_.OutgoingState();
+}
+bool Network::SendFile(const std::string& path, const std::string& transferId, uint8_t mode,
+    const std::atomic<bool>* preparationCancelled)
 {
     std::lock_guard<std::mutex> fileLock(fileSendMutex_);
-
-    namespace fs = std::filesystem;
-
-    constexpr size_t CHUNK_SIZE = FileTransfer::CHUNK_SIZE;
-
-    std::error_code ec;
-    fs::path filePath(path);
-
-    if (!fs::is_regular_file(filePath, ec) || ec)
-    {
-        std::cerr << "Not a regular file\n";
-        return false;
-    }
-
-    const uint64_t fileSize = fs::file_size(filePath, ec);
-
-    if (ec || fileSize > Protocol::MAX_FILE_SIZE)
-    {
-        std::cerr << "File too large or inaccessible\n";
-        return false;
-    }
-
-    std::ifstream file(filePath, std::ios::binary);
-
-    if (!file)
-    {
-        std::cerr << "Cannot open file\n";
-        return false;
-    }
-
-    // 이번 버전은 ASCII 파일명만 지원
-    std::string fileName;
-
-    try
-    {
-        fileName = filePath.filename().string();
-    }
-    catch (const std::exception&)
-    {
-        std::cerr << "Unsupported file name\n";
-        return false;
-    }
-
+    uint64_t fileSize = 0;
+    OwnedHandle file;
+    TransferSpec spec;
     std::string metadata;
-
-    try
-    {
-        metadata = Protocol::MakeFileBegin(
-            static_cast<uint64_t>(fileSize),
-            fileName);
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << e.what() << '\n';
-        return false;
-    }
-
+    try {
+        if (path.find('\0') != std::string::npos) throw std::invalid_argument("Invalid source path");
+        const std::filesystem::path source(FileName::ToWide(path));
+        file = OpenSource(source, fileSize);
+        if (fileSize > Protocol::MAX_FILE_SIZE) throw std::runtime_error("File too large or inaccessible");
+        auto fullHash = HashPrefix(file.value, fileSize, [this, preparationCancelled] { return approvalCancelled_ || (preparationCancelled && preparationCancelled->load()); });
+        spec = { fileSize, FileName::ToUtf8(source.filename().wstring()), fullHash->Hex(), {}, mode };
+        spec.transferId = spec.Identity();
+        if (mode && transferId != spec.transferId) throw std::runtime_error("Source changed or transferId mismatch");
+        Protocol::MakeFileBegin(fileSize, spec.name); // existing safe-name and size validation
+        metadata = spec.Encode();
+    } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return false; }
+    std::osyncstream(std::cout) << "\n[Transfer identity] transferId=" << spec.transferId << " sha256=" << spec.digest << '\n' << std::flush;
     uint64_t id;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
-        if (approvalCancelled_) return false;
-        id = protocol_.StartOutgoing(fileName);
+        if (approvalCancelled_ || (preparationCancelled && preparationCancelled->load())) return false;
+        id = protocol_.StartOutgoing(spec.name, spec);
     }
     if (!id) return false;
-    const auto identifiedMetadata = Protocol::WithRequestId(id, metadata);
-    if (!SendFrame(MessageType::FileRequest, identifiedMetadata)) return false;
-    std::cout << "\nWaiting for file approval...\n" << std::flush;
-    if (!WaitForState(Protocol::SendState::AwaitAccept, Protocol::APPROVAL_TIMEOUT))
-    {
-        std::cerr << "File rejected, cancelled, or timed out\n";
-        return false;
+    Event(AppEvent::Kind::Identity, "Transfer identity", true, id, spec.name, spec.transferId);
+    Event(AppEvent::Kind::State, "AwaitAccept", true, id, spec.name);
+    const auto identified = Protocol::WithRequestId(id, metadata);
+    if (!SendFrame(MessageType::FileRequest, identified)) return false;
+    std::osyncstream(std::cout) << "\nWaiting for file approval...\n" << std::flush;
+    if (!WaitForState(Protocol::SendState::AwaitAccept, Protocol::APPROVAL_TIMEOUT)) {
+        std::cerr << "File rejected, cancelled, or timed out\n"; return false;
     }
+    uint64_t offset;
+    std::string prefix;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
-        if (protocol_.OutgoingState() != Protocol::SendState::Sending || approvalCancelled_)
-            return false;
-    }
-    if (!SendFrame(MessageType::FileBegin, identifiedMetadata)) return false;
-    std::array<char, CHUNK_SIZE> buffer;
-    uint64_t sentBytes = 0;
-    FileTransfer progress;
-    progress.Start(fileName, id, fileSize, true);
-    FileTransfer::Print(*progress.Update(0, true));
-
-    while (sentBytes < fileSize)
-    {
-        size_t toRead = static_cast<size_t>(
-            std::min<uint64_t>(
-                CHUNK_SIZE, fileSize - sentBytes));
-
-#ifdef FILETRANSFER_TESTING
-        if (Stage4Faults::Fail("FTA_TEST_READ_FAIL_AFTER", sentBytes)) file.setstate(std::ios::badbit);
-#endif
-        file.read(buffer.data(), static_cast<std::streamsize>(toRead));
-
-        std::streamsize bytesRead = file.gcount();
-
-        if (bytesRead != static_cast<std::streamsize>(toRead))
-        {
-            {
-                std::lock_guard<std::mutex> lock(protocolMutex_);
-                protocol_.FailOutgoing("File read failed");
-            }
-            std::cerr << "File read failed\n";
-            return false;
+        if (protocol_.OutgoingState() == Protocol::SendState::Completed) {
+            Event(AppEvent::Kind::State, "Completed: verified existing commit", true, id, spec.name);
+            std::osyncstream(std::cout) << "\n[Transfer completed] " << spec.name << " [verified existing commit]\n" << std::flush;
+            return true;
         }
-
-        std::string_view chunk(
-            buffer.data(),
-            static_cast<size_t>(bytesRead));
-
+        if (approvalCancelled_ || protocol_.OutgoingState() != Protocol::SendState::Sending) return false;
+        offset = protocol_.ResumeOffset(); prefix = protocol_.ResumeDigest();
+    }
+    std::unique_ptr<Sha256> streamHash;
+    try {
+        streamHash = HashPrefix(file.value, offset, [this] {
+            std::lock_guard<std::mutex> lock(protocolMutex_);
+            return approvalCancelled_ || protocol_.OutgoingState() != Protocol::SendState::Sending;
+        });
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        protocol_.FailOutgoing("Resume prefix scan failed or cancelled");
+        std::cerr << e.what() << '\n'; return false;
+    }
+    if (streamHash->Hex() != prefix) {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        protocol_.FailOutgoing("Resume prefix SHA-256 mismatch"); return false;
+    }
+    std::osyncstream(std::cout) << "[Resume offset] " << offset << '\n' << std::flush;
+    if (!SendFrame(MessageType::FileBegin, identified)) return false;
+    std::array<char, FileTransfer::CHUNK_SIZE> buffer;
+    uint64_t sentBytes = offset;
+    FileTransfer progress;
+    progress.Start(spec.name, id, fileSize, true, offset);
+    Progress(*progress.Update(offset, true));
+    while (sentBytes < fileSize) {
+        const DWORD wanted = static_cast<DWORD>(std::min<uint64_t>(buffer.size(), fileSize - sentBytes));
+        DWORD read = 0;
+        bool readable = true;
+#ifdef FILETRANSFER_TESTING
+        readable = !Stage4Faults::Fail("FTA_TEST_READ_FAIL_AFTER", sentBytes);
+#endif
+        if (!readable || !ReadFile(file.value, buffer.data(), wanted, &read, nullptr) || read != wanted) {
+            std::lock_guard<std::mutex> lock(protocolMutex_);
+            protocol_.FailOutgoing("File read failed"); std::cerr << "File read failed\n"; return false;
+        }
+        const std::string_view chunk(buffer.data(), read);
+        streamHash->Add(chunk);
         {
             std::lock_guard<std::mutex> lock(protocolMutex_);
-            if (approvalCancelled_ || protocol_.OutgoingState() != Protocol::SendState::Sending)
-                return false;
+            if (approvalCancelled_ || protocol_.OutgoingState() != Protocol::SendState::Sending) return false;
         }
-        // Never hold the state lock during socket I/O: the peer may be sending
-        // concurrently and needs our receiver to drain the other direction.
-        if (!SendParts(MessageType::FileChunk, id, chunk))
-            return false;
-
-        sentBytes += static_cast<uint64_t>(bytesRead);
-
-        if (auto p = progress.Update(sentBytes)) FileTransfer::Print(*p);
+        if (!SendParts(MessageType::FileChunk, id, chunk)) return false;
+        sentBytes += read;
+        if (auto p = progress.Update(sentBytes)) Progress(*p);
     }
-
     {
-        // Publish ACK-wait before END so an immediate response cannot be lost.
-        // No state lock is held during I/O, including the small END frame.
         std::lock_guard<std::mutex> lock(protocolMutex_);
+        if (streamHash->Hex() != spec.digest) { protocol_.FailOutgoing("Source SHA-256 mismatch"); return false; }
         if (approvalCancelled_ || !protocol_.AwaitAck()) return false;
     }
-    if (sentBytes != 0) FileTransfer::Print(*progress.Update(sentBytes, true));
+    if (fileSize) Progress(*progress.Update(sentBytes, true));
     if (!SendFrame(MessageType::FileEnd, Protocol::WithRequestId(id))) return false;
-    std::cout << "\n[Upload finished, waiting for ACK] " << fileName << '\n' << std::flush;
+    Event(AppEvent::Kind::State, "AwaitAck: data sent; storage ACK required", true, id, spec.name);
+    std::osyncstream(std::cout) << "\n[Upload finished, waiting for ACK] " << spec.name << '\n' << std::flush;
     if (!WaitForState(Protocol::SendState::AwaitAck, Protocol::TRANSFER_TIMEOUT)) return false;
-    std::cout << "\n[Transfer completed] " << fileName << "\n> " << std::flush;
+    Event(AppEvent::Kind::State, "Completed: storage ACK verified", true, id, spec.name);
+    std::osyncstream(std::cout) << "\n[Transfer completed] " << spec.name << "\n> " << std::flush;
     return true;
 }
-
 bool Network::WaitForState(Protocol::SendState waiting, std::chrono::seconds timeout)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::unique_lock<std::mutex> lock(protocolMutex_);
-    while (!approvalCancelled_ && protocol_.OutgoingState() == waiting)
+    while (!approvalCancelled_ && (protocol_.OutgoingState() == waiting ||
+        (waiting == Protocol::SendState::AwaitAck && protocol_.OutgoingState() == Protocol::SendState::CancelPending)))
     {
         if (std::chrono::steady_clock::now() >= deadline)
         {
@@ -494,7 +536,7 @@ bool Network::WaitForState(Protocol::SendState waiting, std::chrono::seconds tim
         return true;
     if (approvalCancelled_) return false;
     return waiting == Protocol::SendState::AwaitAccept ?
-        state == Protocol::SendState::Sending : state == Protocol::SendState::Completed;
+        (state == Protocol::SendState::Sending || state == Protocol::SendState::Completed) : state == Protocol::SendState::Completed;
 }
 
 bool Network::SendReplies(std::vector<Protocol::Reply> replies)
@@ -505,32 +547,154 @@ bool Network::SendReplies(std::vector<Protocol::Reply> replies)
     return true;
 }
 
-bool Network::AcceptFile()
+bool Network::AcceptFile(uint64_t expectedRequestId, const std::filesystem::path& folder)
 {
-    uint64_t id;
+    Protocol::IncomingFileRequest request;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
         protocol_.CheckTimeouts();
-        id = protocol_.ApproveFileRequest();
+        if (!protocol_.TakeFileRequest(request) || (expectedRequestId && request.requestId != expectedRequestId)) { std::osyncstream(std::cout) << "No pending file request\n"; return false; }
     }
-    if (!id) { std::cout << "No pending file request\n"; return false; }
-    return SendFrame(MessageType::FileAccept, Protocol::WithRequestId(id));
+    std::unique_ptr<TransferStorage> prepared;
+    std::string error;
+    if (request.spec.mode) {
+        try { prepared = TransferStorage::Recover(request.spec, [this, &request] {
+            std::lock_guard<std::mutex> lock(protocolMutex_);
+            Protocol::IncomingFileRequest current;
+            return approvalCancelled_ || !protocol_.TakeFileRequest(current) ||
+                current.requestId != request.requestId || current.generation != request.generation;
+        }, folder); }
+        catch (const std::exception& e) { error = e.what(); }
+    }
+    uint64_t id;
+    std::vector<Protocol::Reply> replies;
+    if (!request.spec.mode && !folder.empty()) {
+        try { prepared = TransferStorage::Create(request.spec, folder); }
+        catch (const std::exception& e) { error = e.what(); }
+    }
+    // A response validated on the old session must never be published on its
+    // replacement socket. Do not hold this lock during the recovery hash scan.
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
+    {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        Protocol::IncomingFileRequest current;
+        const bool valid = protocol_.TakeFileRequest(current) && current.requestId == request.requestId && current.generation == request.generation;
+        id = valid ? protocol_.ApproveFileRequest(request, std::move(prepared), error) : 0;
+        if (id) replies = protocol_.TakeReplies();
+    }
+    if (!id) {
+        // Fresh storage prepared for an expired approval must not become an orphan.
+        if (prepared && !request.spec.mode) prepared->Abort(true);
+        return false;
+    }
+    return SendReplies(std::move(replies));
 }
-
-bool Network::RejectFile()
+bool Network::RejectFile(uint64_t expectedRequestId)
 {
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
     uint64_t id;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
         protocol_.CheckTimeouts();
+        Protocol::IncomingFileRequest pending;
+        if (expectedRequestId && (!protocol_.TakeFileRequest(pending) || pending.requestId != expectedRequestId)) return false;
         id = protocol_.RejectFileRequest();
     }
-    if (!id) { std::cout << "No pending file request\n"; return false; }
+    if (!id) { std::osyncstream(std::cout) << "No pending file request\n"; return false; }
     return SendFrame(MessageType::FileReject, Protocol::WithRequestId(id));
+}
+
+bool Network::CancelFile(uint64_t requestId)
+{
+    bool cancelled;
+    {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        cancelled = protocol_.Cancel(requestId);
+    }
+    approvalCv_.notify_all();
+    // The receiver drains the bounded control queue on its next poll. Do not
+    // block the console on sendMutex_ while a file frame is in flight.
+    if (!cancelled) std::osyncstream(std::cout) << "No matching active transfer\n" << std::flush;
+    return cancelled;
 }
 
 void Network::CancelPendingApproval()
 {
     approvalCancelled_ = true;
     approvalCv_.notify_all();
+}
+
+bool Network::IsConnected()
+{
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    return !stopping_ && socket_ != INVALID_SOCKET;
+}
+
+void Network::RequestStop()
+{
+    userStopping_ = true;
+    retryCv_.notify_all();
+    StopConnection();
+}
+
+bool Network::WaitForSocket(SOCKET socket, bool writable, std::chrono::seconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!userStopping_ && std::chrono::steady_clock::now() < deadline)
+    {
+        fd_set ready, failed;
+        FD_ZERO(&ready); FD_ZERO(&failed);
+        FD_SET(socket, &ready); FD_SET(socket, &failed);
+        timeval wait{ 0, 250000 };
+        const int result = select(0, writable ? nullptr : &ready,
+            writable ? &ready : nullptr, &failed, &wait);
+        if (result == SOCKET_ERROR || FD_ISSET(socket, &failed)) return false;
+        if (result > 0 && FD_ISSET(socket, &ready)) return true;
+    }
+    return false;
+}
+
+bool Network::Reconnect()
+{
+    // No new socket can be adopted until an old SendFile has returned.
+    std::lock_guard<std::mutex> fileLock(fileSendMutex_);
+    std::lock_guard<std::mutex> controlLock(controlMutex_);
+    if (userStopping_ || !endpointPort_) return false;
+    Disconnect();
+    {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        protocol_.ResetSession();
+    }
+    reconnectAttempt_ = true;
+    const bool host = endpointHost_;
+    const auto ip = endpointIp_;
+    const auto port = endpointPort_;
+    const bool connected = host ? StartServer(port, ip) : Connect(ip, port);
+    reconnectAttempt_ = false;
+    return connected;
+}
+
+void Network::ReceiveLoop()
+{
+    while (!userStopping_)
+    {
+        ReceiveSession();
+        if (!autoReconnect_ || userStopping_) break;
+        bool connected = false;
+        for (int attempt = 0; attempt < 3 && !userStopping_; ++attempt)
+        {
+            std::osyncstream(std::cout) << "\n[Reconnect attempt] " << attempt + 1 << "/3\n" << std::flush;
+            std::unique_lock<std::mutex> lock(retryMutex_);
+            if (retryCv_.wait_for(lock, std::chrono::milliseconds(250 << attempt),
+                [this] { return userStopping_.load(); })) break;
+            lock.unlock();
+            if (Reconnect()) { connected = true; break; }
+        }
+        if (!connected)
+        {
+            if (!userStopping_) std::osyncstream(std::cout) << "Reconnect attempts exhausted\n" << std::flush;
+            break;
+        }
+        std::osyncstream(std::cout) << "[Reconnected] new requestId session\n" << std::flush;
+    }
 }

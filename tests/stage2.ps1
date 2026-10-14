@@ -13,12 +13,16 @@ function Approve($c,[byte[]]$metadata) {
     $c.App.Send('/accept')
     Assert ((Read-Frame $c.Peer).Type -eq 7) 'Expected FILE_ACCEPT'
 }
-function Expect-Error($c) {
+function Expect-Error($c,[switch]$ConnectionAlive) {
     $frame = Read-Frame $c.Peer
     Assert ($frame.Type -eq 9) 'Expected FILE_ERROR'
     Assert ($frame.Payload.Length -gt 0) 'Missing failure reason'
-    $stream = $c.Peer.GetStream()
-    Assert ($stream.ReadByte() -eq -1) 'Connection should stop after FILE_ERROR'
+    if ($ConnectionAlive) {
+        Write-Frame $c.Peer 1 ([Text.Encoding]::ASCII.GetBytes('storage-failure-barrier'))
+        $c.App.WaitText('[Received TEXT] storage-failure-barrier')
+    } else {
+        Assert ($c.Peer.GetStream().ReadByte() -eq -1) 'Connection should stop after FILE_ERROR'
+    }
     $c.App.Send('/quit'); $c.App.WaitExit()
 }
 function Save-Log($c,[string]$name) {
@@ -37,6 +41,7 @@ foreach ($mode in @('unapproved','pending','rejected','wrong-name','wrong-size',
     [byte[]]$meta = Metadata 10 'approved.txt'
     $original = 'keep existing bytes untouched'
     try {
+        if ($mode -eq 'commit-collision') { $script:rawDigest = SHA256-Bytes ([byte[]](1..10)) }
         switch ($mode) {
             'pending' {
                 Write-Frame $c.Peer 6 $meta
@@ -90,7 +95,7 @@ foreach ($mode in @('unapproved','pending','rejected','wrong-name','wrong-size',
                 }
             }
         }
-        Expect-Error $c
+        Expect-Error $c -ConnectionAlive:($mode -in @('existing-final','existing-part','directory-blocked','commit-collision'))
         if ($mode -in @('existing-final','commit-collision')) {
             Assert ([IO.File]::ReadAllText($final) -eq $original) 'Existing destination changed'
         } else { Assert (!(Test-Path $final)) 'Unexpected final file' }
@@ -107,7 +112,7 @@ foreach ($mode in @('unapproved','pending','rejected','wrong-name','wrong-size',
             Assert ([IO.File]::ReadAllText($folder) -eq $original) 'Directory blocker changed'
         }
         Pass "receive validation, ownership and error notice: $mode"
-    } finally { Save-Log $c $mode }
+    } finally { $script:rawDigest = $null; Save-Log $c $mode }
 }
 
 foreach ($size in @(0,1MB)) {
@@ -115,6 +120,7 @@ foreach ($size in @(0,1MB)) {
     try {
         [byte[]]$data = New-Object byte[] $size
         [Random]::new(2026).NextBytes($data)
+        $script:rawDigest = SHA256-Bytes $data
         [byte[]]$meta = Metadata $size 'normal.bin'
         Approve $c $meta
         Write-Frame $c.Peer 2 $meta
@@ -135,7 +141,7 @@ foreach ($size in @(0,1MB)) {
         $c.App.Send('/quit'); $c.App.WaitExit()
         Assert (Test-Path $saved) 'Cleanup removed committed file'
         Pass "approved normal transfer, commit and SHA-256: $size bytes"
-    } finally { Save-Log $c "normal-$size" }
+    } finally { $script:rawDigest = $null; Save-Log $c "normal-$size" }
 }
 
 $c = New-RawConnection
