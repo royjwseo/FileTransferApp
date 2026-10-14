@@ -5,8 +5,11 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
+using System.Runtime.InteropServices;
 
 public sealed class FrameRelay : IDisposable {
+    [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr h,uint mask,uint flags);
+    static void Isolate(Socket socket) { if(!SetHandleInformation(socket.Handle,1,0)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
     readonly TcpListener listener;
     readonly TcpClient server = new TcpClient();
     TcpClient client;
@@ -30,9 +33,11 @@ public sealed class FrameRelay : IDisposable {
     public FrameRelay(int targetPort) {
         listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
+        Isolate(listener.Server);
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
         try { server.Connect(IPAddress.Loopback, targetPort); }
         catch { listener.Stop(); server.Close(); throw; }
+        Isolate(server.Client);
         acceptThread = new Thread(Accept);
         acceptThread.IsBackground = true;
         acceptThread.Start();
@@ -40,6 +45,7 @@ public sealed class FrameRelay : IDisposable {
     void Accept() {
         try {
             TcpClient accepted = listener.AcceptTcpClient();
+            Isolate(accepted.Client);
             lock(stateLock) {
                 if (stopped) { accepted.Close(); return; }
                 client = accepted;

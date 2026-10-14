@@ -23,6 +23,9 @@ public:
     Network& operator=(const Network&) = delete;
 
     bool Initialize();
+    // Set before starting workers. Setup polls with a bounded wait for GUI use.
+    void SetEvents(std::shared_ptr<EventQueue> events, uint64_t session = 0) { events_ = events; eventSession_ = session; protocol_.SetEvents(std::move(events), session); }
+    void EnableInterruptibleSetup() { interruptibleSetup_ = true; }
 
     bool StartServer(uint16_t port, const std::string& bindIp = "0.0.0.0");
     bool Connect(const std::string& ip, uint16_t port);
@@ -34,10 +37,13 @@ public:
     // Call after workers have been joined. Also serializes with in-flight I/O.
     void Disconnect();
 
-    bool SendFile(const std::string& path, const std::string& transferId = {}, uint8_t mode = 0);
+    bool SendFile(const std::string& path, const std::string& transferId = {}, uint8_t mode = 0,
+        const std::atomic<bool>* preparationCancelled = nullptr);
+    uint64_t OutgoingRequestId();
+    Protocol::SendState OutgoingState();
 public:
-    bool AcceptFile();
-    bool RejectFile();
+    bool AcceptFile(uint64_t expectedRequestId = 0);
+    bool RejectFile(uint64_t expectedRequestId = 0);
     bool CancelFile(uint64_t requestId = 0);
     bool Reconnect();
     bool IsConnected();
@@ -87,4 +93,10 @@ private:
     // Serialize console approval/rejection publication with socket replacement.
     // Reconnect acquires fileSendMutex_ first; never reverse that order.
     std::mutex controlMutex_;
+    bool interruptibleSetup_ = false;
+    std::shared_ptr<EventQueue> events_;
+    uint64_t eventSession_ = 0;
+    void Event(AppEvent::Kind kind, std::string text, bool sending = false,
+        uint64_t id = 0, std::string name = {}, std::string transferId = {});
+    void Progress(const FileTransfer::Progress& progress);
 };

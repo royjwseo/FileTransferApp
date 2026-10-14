@@ -98,6 +98,16 @@ void Protocol::Configure(bool host)
     nextId_ = host ? 1 : 2;
 }
 
+void Protocol::EventState(const char* text, bool sending, uint64_t id)
+{
+    if (!events_) return;
+    AppEvent event; event.kind = AppEvent::Kind::State; event.text = text;
+    event.sending = sending; event.requestId = id; event.session = eventSession_;
+    event.name = sending ? outgoingName_ : incoming_.fileName;
+    event.total = sending ? outgoingSpec_.size : incoming_.fileSize;
+    events_->Push(std::move(event));
+}
+
 uint64_t Protocol::StartOutgoing(const std::string& name, const TransferSpec& spec)
 {
     if (sendState_ == SendState::AwaitAccept || sendState_ == SendState::Sending ||
@@ -145,11 +155,13 @@ bool Protocol::Cancel(uint64_t id, bool notify)
         id = incomingId_;
         cancelledIncoming_.push_back(id);
         if (cancelledIncoming_.size() > 64) cancelledIncoming_.erase(cancelledIncoming_.begin());
+        EventState("Cancelled", false, id);
         ClearIncoming();
         receiveState_ = ReceiveState::Cancelled;
     }
     else return false; // Completed, unknown and duplicate cancellation is inert.
     if (notify) replies_.push_back({ MessageType::FileCancel, id, {} });
+    if(id == outgoingId_) EventState(sendState_ == SendState::CancelPending ? "CancelPending" : "Cancelled", true, id);
     std::osyncstream(std::cout) << ((id == outgoingId_ && sendState_ == SendState::CancelPending) ?
         "\n[Cancel requested; awaiting outcome] requestId=" : "\n[Transfer cancelled] requestId=") << id << '\n' << std::flush;
     return true;
@@ -169,11 +181,13 @@ uint64_t Protocol::ApproveFileRequest(const IncomingFileRequest& request,
         generation_ != request.generation) return 0;
     const auto id = incomingId_;
     if (!error.empty()) {
+        EventState("Failed: recovery validation",false,id);
         replies_.push_back({ MessageType::FileError, id, error.substr(0, 256) });
         ClearIncoming(); return id;
     }
     storage_ = std::move(prepared);
     if (storage_ && storage_->Complete()) {
+        EventState("Saved: verified existing commit",false,id);
         replies_.push_back({ MessageType::FileComplete, id, incoming_.spec.transferId + incoming_.spec.digest });
         ClearIncoming(true); return id;
     }
@@ -190,6 +204,7 @@ uint64_t Protocol::RejectFileRequest()
 {
     if (receiveState_ != ReceiveState::PendingApproval) return 0;
     const auto id = incomingId_;
+    EventState("Rejected", false, id);
     ClearIncoming();
     return id;
 }
@@ -211,6 +226,7 @@ void Protocol::CheckTimeouts()
     {
         replies_.push_back({ MessageType::FileError, incomingId_, "Receive request timed out" });
         std::cerr << "Receive request timed out\n" << std::flush;
+        EventState("Failed: receive timed out", false, incomingId_);
         ClearIncoming();
     }
 }
@@ -258,6 +274,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
 {
     if (type == MessageType::Text)
     {
+        if (events_) { AppEvent e; e.kind = AppEvent::Kind::Text; e.text = payload; e.session = eventSession_; events_->Push(std::move(e)); }
         std::osyncstream output(std::cout); output << "\n[Received TEXT] ";
         output.write(payload.data(), payload.size()); output << "\n> " << std::flush;
         return true;
@@ -273,6 +290,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
         if (!payload.empty()) return false;
         if (id == outgoingId_ && sendState_ == SendState::CancelPending) {
             sendState_ = SendState::Cancelled;
+            EventState("Cancelled",true,id);
             std::osyncstream(std::cout) << "\n[Transfer cancelled] requestId=" << id << '\n' << std::flush;
         } else if (Cancel(id, false)) {
             replies_.push_back({ MessageType::FileCancel, id, {} });
@@ -299,6 +317,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
             if (id == incomingId_ && receiveState_ != ReceiveState::Idle)
             {
                 std::cerr << "\n[Peer file error] " << payload << '\n' << std::flush;
+                EventState("Failed: peer file error", false, id);
                 ClearIncoming();
                 return true; // Never reply to FILE_ERROR.
             }
@@ -368,6 +387,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
         const auto size = spec.size; const auto name = spec.name;
         if (size > MAX_FILE_SIZE || !FileName::IsSafe(name)) return FailFile("Invalid file metadata");
         incoming_ = { name, size, id, spec, generation_ };
+        if (events_) { AppEvent e; e.kind = AppEvent::Kind::Request; e.name = name; e.total = size; e.requestId = id; e.transferId = spec.transferId; e.session = eventSession_; events_->Push(std::move(e)); }
         receiveState_ = ReceiveState::PendingApproval;
         receiveDeadline_ = Clock::now() + APPROVAL_TIMEOUT;
         std::osyncstream(std::cout) << "\n[Incoming file request] " << name << " (" << size
@@ -443,6 +463,7 @@ bool Protocol::EndFile()
     if (!receivingFile_ || !storage_ || receivedSize_ != expectedSize_) return FailFile("File ended without matching approved size");
     try {
         storage_->Commit();
+        EventState("Saved: hash verified", false, incomingId_);
         pendingProgress_ = receiveProgress_.Update(receivedSize_, true);
         receivingFile_ = false;
         std::osyncstream(std::cout) << "\n[File saved] received/" << incoming_.fileName << "\n> " << std::flush;
@@ -451,7 +472,7 @@ bool Protocol::EndFile()
 }
 void Protocol::AbortFile()
 {
-    if (storage_) { try { storage_->Abort(true); } catch (const std::exception& e) { std::cerr << e.what() << '\n'; } storage_.reset(); }
+    if (storage_) { try { storage_->Abort(true); } catch (const std::exception& e) { EventState("Failed: temporary cleanup",false,incomingId_);std::cerr << e.what() << '\n'; } storage_.reset(); }
     receivingFile_ = false; expectedSize_ = receivedSize_ = 0;
 }
 void Protocol::ClearIncoming(bool preserve)
@@ -461,6 +482,7 @@ void Protocol::ClearIncoming(bool preserve)
 }
 bool Protocol::FailFile(const char* reason, bool fatal)
 {
+    EventState("Failed: receive", false, incomingId_);
     if (incomingId_) replies_.push_back({ MessageType::FileError, incomingId_, reason });
     if (!fatal && incomingId_) {
         cancelledIncoming_.push_back(incomingId_);

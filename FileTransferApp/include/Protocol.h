@@ -8,6 +8,7 @@
 #include <vector>
 #include "FileTransfer.h"
 #include "TransferStorage.h"
+#include "Events.h"
 
 enum class MessageType : uint8_t {
     Text = 1, FileBegin = 2, FileChunk = 3, FileEnd = 4, FileAck = 5,
@@ -43,10 +44,12 @@ public:
     static std::string MakeFileBegin(uint64_t fileSize, const std::string& fileName);
     static std::string WithRequestId(uint64_t id, std::string_view payload = {});
     void Configure(bool host);
+    void SetEvents(std::shared_ptr<EventQueue> events, uint64_t session = 0) { events_ = std::move(events); eventSession_ = session; }
     uint64_t StartOutgoing(const std::string& name, const TransferSpec& spec);
     uint64_t ResumeOffset() const { return resumeOffset_; }
     std::string ResumeDigest() const { return resumeDigest_; }
     SendState OutgoingState() const { return sendState_; }
+    uint64_t OutgoingId() const { return outgoingId_; }
     bool AwaitAck();
     void FailOutgoing(const char* reason);
     bool Cancel(uint64_t id = 0, bool notify = true);
@@ -89,4 +92,7 @@ private:
     void ClearIncoming(bool preserve = false);
     bool FailFile(const char* reason, bool fatal = true);
     bool recoverableError_ = false;
+    std::shared_ptr<EventQueue> events_;
+    uint64_t eventSession_ = 0;
+    void EventState(const char* text, bool sending, uint64_t id);
 };
