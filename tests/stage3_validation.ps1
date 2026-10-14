@@ -130,7 +130,7 @@ foreach ($arguments in @('--help','--version')) {
     $app = New-App ([Guid]::NewGuid().ToString('N')) $arguments
     try {
         $app.WaitExit()
-        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=5 requestId64-parity')) 'Missing protocol version' }
+        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=6 requestId64-parity')) 'Missing protocol version' }
         else { Assert ($app.Output.Contains('--host')) 'Missing usage' }
     } finally { $app.Dispose() }
 }

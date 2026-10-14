@@ -32,7 +32,7 @@ public:
         uint64_t generation = 0;
     };
     struct Reply { MessageType type; uint64_t requestId; std::string payload; };
-    static constexpr uint32_t WIRE_VERSION = 5;
+    static constexpr uint32_t WIRE_VERSION = 6;
     static constexpr size_t HEADER_SIZE = 5;
     static constexpr uint32_t MAX_PAYLOAD = 1024 * 1024;
     static constexpr uint64_t MAX_FILE_SIZE = 1ULL << 40; // 1 TiB, includes >4 GiB.

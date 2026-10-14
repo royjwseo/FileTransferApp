@@ -25,4 +25,4 @@ foreach($test in @('stage1','stage2','stage3','stage3_validation','stage4','stag
         throw "Test failed or execution blocked: $test. See recorded log and events. No push authorized."
     }
 }
-Write-Output ('Total PASS: ' + (($results | Measure-Object -Property pass -Sum).Sum))
+Write-Output ('Total PASS: ' + (($results | ForEach-Object { $_['pass'] } | Measure-Object -Sum).Sum))

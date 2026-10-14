@@ -20,6 +20,8 @@ public sealed class TestApp : IDisposable {
             Arguments = arguments,
             WorkingDirectory = cwd, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardInput = true, RedirectStandardOutput = true,
+            StandardOutputEncoding = new UTF8Encoding(false, true),
+            StandardErrorEncoding = new UTF8Encoding(false, true),
             RedirectStandardError = true } };
         Process.Start();
         stdout = new Thread(() => Read(Process.StandardOutput));
@@ -32,7 +34,11 @@ public sealed class TestApp : IDisposable {
         while ((c = reader.Read()) != -1) lock(output) output.Append((char)c);
     }
     public string Output { get { lock(output) return output.ToString(); } }
-    public void Send(string line) { Process.StandardInput.WriteLine(line); Process.StandardInput.Flush(); }
+    public void Send(string line) {
+        byte[] bytes = new UTF8Encoding(false, true).GetBytes(line + Environment.NewLine);
+        Process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length);
+        Process.StandardInput.BaseStream.Flush();
+    }
     public void WaitText(string text, int timeout = 5000) {
         var watch = Stopwatch.StartNew();
         while (watch.ElapsedMilliseconds < timeout) {

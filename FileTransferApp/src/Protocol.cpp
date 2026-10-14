@@ -1,5 +1,6 @@
 ﻿
 #include "Protocol.h"
+#include "FileName.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -20,37 +21,6 @@ namespace fs = std::filesystem;
 
 namespace
 {
-    // 실습용 안전한 파일명 검사
-    bool IsSafeFileName(std::string_view name)
-    {
-        if (name.empty() || name.size() > 100)
-            return false;
-
-        if (name.front() == '.' || name.back() == '.')
-            return false;
-
-        for (unsigned char ch : name)
-        {
-            bool allowed =
-                (ch >= 'a' && ch <= 'z') ||
-                (ch >= 'A' && ch <= 'Z') ||
-                (ch >= '0' && ch <= '9') ||
-                ch == '.' || ch == '_' || ch == '-';
-
-            if (!allowed)
-                return false;
-        }
-
-        std::string base(name.substr(0, name.find('.')));
-        std::transform(base.begin(), base.end(), base.begin(),
-            [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-        if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
-            (base.size() == 4 && (base.substr(0, 3) == "COM" || base.substr(0, 3) == "LPT") &&
-                base[3] >= '1' && base[3] <= '9'))
-            return false;
-        return true;
-    }
-
     void AppendU64(std::string& out, uint64_t value)
     {
         for (int i = 7; i >= 0; --i)
@@ -101,7 +71,7 @@ std::string Protocol::MakeFileBegin(
     const std::string& fileName)
 {
     if (fileSize > MAX_FILE_SIZE ||
-        !IsSafeFileName(fileName))
+        !FileName::IsSafe(fileName))
         throw std::invalid_argument("Invalid file metadata");
 
     std::string payload;
@@ -396,7 +366,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
         try { spec = TransferSpec::Decode(payload); }
         catch (const std::exception& e) { return FailFile(e.what()); }
         const auto size = spec.size; const auto name = spec.name;
-        if (size > MAX_FILE_SIZE || !IsSafeFileName(name)) return FailFile("Invalid file metadata");
+        if (size > MAX_FILE_SIZE || !FileName::IsSafe(name)) return FailFile("Invalid file metadata");
         incoming_ = { name, size, id, spec, generation_ };
         receiveState_ = ReceiveState::PendingApproval;
         receiveDeadline_ = Clock::now() + APPROVAL_TIMEOUT;

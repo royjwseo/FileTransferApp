@@ -1,6 +1,7 @@
 ﻿#define NOMINMAX
 
 #include "Network.h"
+#include "FileName.h"
 
 #include <iostream>
 #include <syncstream>
@@ -374,11 +375,12 @@ bool Network::SendFile(const std::string& path, const std::string& transferId, u
     TransferSpec spec;
     std::string metadata;
     try {
-        const std::filesystem::path source(path);
+        if (path.find('\0') != std::string::npos) throw std::invalid_argument("Invalid source path");
+        const std::filesystem::path source(FileName::ToWide(path));
         file = OpenSource(source, fileSize);
         if (fileSize > Protocol::MAX_FILE_SIZE) throw std::runtime_error("File too large or inaccessible");
         auto fullHash = HashPrefix(file.value, fileSize, [this] { return approvalCancelled_.load(); });
-        spec = { fileSize, source.filename().string(), fullHash->Hex(), {}, mode };
+        spec = { fileSize, FileName::ToUtf8(source.filename().wstring()), fullHash->Hex(), {}, mode };
         spec.transferId = spec.Identity();
         if (mode && transferId != spec.transferId) throw std::runtime_error("Source changed or transferId mismatch");
         Protocol::MakeFileBegin(fileSize, spec.name); // existing safe-name and size validation

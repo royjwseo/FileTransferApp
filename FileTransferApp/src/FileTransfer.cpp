@@ -6,6 +6,7 @@
 #include <syncstream>
 #include <utility>
 #include "TransferStorage.h"
+#include "FileName.h"
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -20,6 +21,54 @@
 #endif
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+
+std::wstring FileName::ToWide(std::string_view utf8) {
+    if (utf8.empty()) return {};
+    if (utf8.size() > INT_MAX) throw std::invalid_argument("UTF-8 input too long");
+    const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (!count) throw std::invalid_argument("Invalid UTF-8");
+    std::wstring wide(count, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(),
+        static_cast<int>(utf8.size()), wide.data(), count) != count)
+        throw std::invalid_argument("Invalid UTF-8");
+    return wide;
+}
+std::string FileName::ToUtf8(std::wstring_view utf16) {
+    if (utf16.empty()) return {};
+    if (utf16.size() > INT_MAX) throw std::invalid_argument("UTF-16 input too long");
+    const int count = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+        utf16.data(), static_cast<int>(utf16.size()), nullptr, 0, nullptr, nullptr);
+    if (!count) throw std::invalid_argument("Invalid UTF-16");
+    std::string utf8(count, '\0');
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, utf16.data(),
+        static_cast<int>(utf16.size()), utf8.data(), count, nullptr, nullptr) != count)
+        throw std::invalid_argument("Invalid UTF-16");
+    return utf8;
+}
+bool FileName::IsSafe(std::string_view utf8) {
+    if (utf8.empty() || utf8.size() > MAX_UTF8_BYTES) return false;
+    std::wstring name;
+    try { name = ToWide(utf8); } catch (const std::invalid_argument&) { return false; }
+    if (name.size() > MAX_UTF16_UNITS || name.front() == L'.' || name.front() == L' ' ||
+        name.back() == L'.' || name.back() == L' ') return false;
+    for (wchar_t ch : name) {
+        if (ch < 32 || (ch >= 0x7f && ch <= 0x9f) || ch == 0xfeff ||
+            ch == 0x2028 || ch == 0x2029 || (ch >= 0x202a && ch <= 0x202e) ||
+            (ch >= 0x2066 && ch <= 0x2069) ||
+            std::wstring_view(L"<>:\"/\\|?*").find(ch) != std::wstring_view::npos) return false;
+    }
+    std::wstring base = name.substr(0, name.find(L'.'));
+    while (!base.empty() && (base.back() == L' ' || base.back() == L'.')) base.pop_back();
+    for (auto& ch : base) if (ch >= L'a' && ch <= L'z') ch -= L'a' - L'A';
+    if (base == L"CON" || base == L"PRN" || base == L"AUX" || base == L"NUL" ||
+        base == L"CLOCK$" || base == L"CONIN$" || base == L"CONOUT$") return false;
+    if (base.size() == 4 && (base.substr(0, 3) == L"COM" || base.substr(0, 3) == L"LPT")) {
+        const auto digit = base[3];
+        if ((digit >= L'1' && digit <= L'9') || digit == 0xb9 || digit == 0xb2 || digit == 0xb3) return false;
+    }
+    return true; // Preserve exact Unicode sequence; no normalization or rewriting.
+}
 
 namespace {
     void Require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
@@ -103,12 +152,12 @@ std::string TransferSpec::Encode() const {
     bytes += static_cast<char>(mode); Append64(bytes, size); bytes += name; return bytes;
 }
 TransferSpec TransferSpec::Decode(std::string_view bytes) {
-    Require(bytes.size() >= 138 && bytes.size() <= 237, "Invalid file metadata");
+    Require(bytes.size() >= 138 && bytes.size() <= 137 + FileName::MAX_UTF8_BYTES, "Invalid file metadata");
     TransferSpec s;
     s.transferId = bytes.substr(0, 64); s.digest = bytes.substr(64, 64);
     s.mode = static_cast<uint8_t>(bytes[128]); s.size = Decode64(bytes.substr(129, 8));
     s.name = bytes.substr(137);
-    Require(s.mode <= 2 && HexDigest(s.digest) && HexDigest(s.transferId) &&
+    Require(FileName::IsSafe(s.name) && s.mode <= 2 && HexDigest(s.digest) && HexDigest(s.transferId) &&
         s.Identity() == s.transferId, "Invalid transfer identity");
     return s; // filename and upper size bound are validated by Protocol before I/O
 }
@@ -151,7 +200,8 @@ void TransferStorage::PinDirectory(bool create) {
     Require(GetFileInformationByHandle(directory_.value, &info) &&
         (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
         !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT), "Unsafe receive directory");
-    final_ = folder / spec_.name; part_ = final_; part_ += ".part";
+    Require(FileName::IsSafe(spec_.name), "Invalid file name");
+    final_ = folder / FileName::ToWide(spec_.name); part_ = final_; part_ += ".part";
     manifestPath_ = part_; manifestPath_ += ".fta";
 }
 std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spec) {

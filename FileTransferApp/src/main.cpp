@@ -13,6 +13,23 @@
 
 namespace
 {
+    struct ConsoleUtf8 {
+        UINT input = 0, output = 0;
+        bool valid = true;
+        ConsoleUtf8() {
+            DWORD mode;
+            if (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode)) {
+                input = GetConsoleCP(); valid = SetConsoleCP(CP_UTF8) != FALSE;
+            }
+            if (GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode)) {
+                output = GetConsoleOutputCP(); valid = (SetConsoleOutputCP(CP_UTF8) != FALSE) && valid;
+            }
+        }
+        ~ConsoleUtf8() {
+            if (input) SetConsoleCP(input);
+            if (output) SetConsoleOutputCP(output);
+        }
+    };
     void PrintVersion()
     {
         std::osyncstream(std::cout) << "FileTransferApp protocol=" << Protocol::WIRE_VERSION
@@ -49,6 +66,8 @@ namespace
 
 int main(int argc, char* argv[])
 {
+    ConsoleUtf8 console;
+    if (!console.valid) { std::cerr << "Cannot configure console UTF-8\n"; return 1; }
     const bool interactive = argc == 1;
     int choice = 0;
     uint16_t port = 9000;
