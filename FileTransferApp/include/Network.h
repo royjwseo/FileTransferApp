@@ -24,7 +24,7 @@ public:
 
     bool Initialize();
 
-    bool StartServer(uint16_t port);
+    bool StartServer(uint16_t port, const std::string& bindIp = "0.0.0.0");
     bool Connect(const std::string& ip, uint16_t port);
 
     bool SendText(const std::string& text);

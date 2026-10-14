@@ -34,7 +34,7 @@ bool Network::Initialize()
     return true;
 }
 
-bool Network::StartServer(uint16_t port)
+bool Network::StartServer(uint16_t port, const std::string& bindIp)
 {
     SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -46,7 +46,12 @@ bool Network::StartServer(uint16_t port)
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (inet_pton(AF_INET, bindIp.c_str(), &addr.sin_addr) != 1)
+    {
+        std::cerr << "Invalid bind IPv4 address\n";
+        closesocket(listenSocket);
+        return false;
+    }
     addr.sin_port = htons(port);
 
     if (bind(listenSocket, reinterpret_cast<sockaddr*>(&addr),
@@ -64,7 +69,8 @@ bool Network::StartServer(uint16_t port)
         return false;
     }
 
-    std::cout << "Waiting for connection on port " << port << "...\n";
+    std::cout << "Waiting for connection on port " << port
+        << " (bind " << bindIp << ")...\n" << std::flush;
 
     SOCKET accepted = accept(listenSocket, nullptr, nullptr);
 
@@ -163,7 +169,7 @@ void Network::ReceiveLoop()
             }
             else if (n == 0)
             {
-                std::cout << "\nPeer disconnected.\n";
+                std::cout << "\nPeer disconnected.\n" << std::flush;
                 break;
             }
             else
@@ -465,8 +471,12 @@ bool Network::WaitForState(Protocol::SendState waiting, std::chrono::seconds tim
         approvalCv_.wait_until(lock, std::min(deadline,
             std::chrono::steady_clock::now() + std::chrono::milliseconds(250)));
     }
-    if (approvalCancelled_) return false;
     const auto state = protocol_.OutgoingState();
+    // A subsequent FIN/stop cannot undo a matching storage ACK already parsed.
+    // SendFile reaches this wait only after END was successfully sent.
+    if (waiting == Protocol::SendState::AwaitAck && state == Protocol::SendState::Completed)
+        return true;
+    if (approvalCancelled_) return false;
     return waiting == Protocol::SendState::AwaitAccept ?
         state == Protocol::SendState::Sending : state == Protocol::SendState::Completed;
 }

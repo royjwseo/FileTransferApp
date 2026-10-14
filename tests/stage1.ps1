@@ -14,8 +14,10 @@ public sealed class TestApp : IDisposable {
     public readonly Process Process;
     readonly StringBuilder output = new StringBuilder();
     readonly Thread stdout, stderr;
-    public TestApp(string exe, string cwd) {
+    public TestApp(string exe, string cwd) : this(exe, cwd, "") { }
+    public TestApp(string exe, string cwd, string arguments) {
         Process = new Process { StartInfo = new ProcessStartInfo(exe) {
+            Arguments = arguments,
             WorkingDirectory = cwd, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardInput = true, RedirectStandardOutput = true,
             RedirectStandardError = true } };
@@ -51,10 +53,10 @@ public sealed class TestApp : IDisposable {
 }
 '@
 
-function New-App([string]$name) {
+function New-App([string]$name,[string]$Arguments = '') {
     $dir = Join-Path $runDir $name
     New-Item -ItemType Directory -Force $dir | Out-Null
-    return [TestApp]::new($Exe,$dir)
+    return [TestApp]::new($Exe,$dir,$Arguments)
 }
 function New-RawConnection {
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,9000)

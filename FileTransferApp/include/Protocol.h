@@ -28,6 +28,7 @@ public:
         uint64_t requestId = 0;
     };
     struct Reply { MessageType type; uint64_t requestId; std::string payload; };
+    static constexpr uint32_t WIRE_VERSION = 3;
     static constexpr size_t HEADER_SIZE = 5;
     static constexpr uint32_t MAX_PAYLOAD = 1024 * 1024;
     static constexpr uint64_t MAX_FILE_SIZE = 100ULL * 1024 * 1024;

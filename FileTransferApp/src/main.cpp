@@ -1,15 +1,33 @@
 ﻿#define NOMINMAX
 #include <atomic>
+#include <charconv>
 #include <iostream>
 #include <exception>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "Network.h"
 
 namespace
 {
+    void PrintVersion()
+    {
+        std::cout << "FileTransferApp protocol=" << Protocol::WIRE_VERSION
+            << " requestId64-parity maxFileBytes=" << Protocol::MAX_FILE_SIZE << '\n';
+    }
+
+    void PrintUsage()
+    {
+        std::cout << "Usage:\n"
+            << "  FileTransferApp.exe                         Interactive menu, port 9000\n"
+            << "  FileTransferApp.exe --host [--bind IPv4] [--port 1..65535]\n"
+            << "  FileTransferApp.exe --connect IPv4 [--port 1..65535]\n"
+            << "  FileTransferApp.exe --version\n"
+            << "  FileTransferApp.exe --help\n";
+    }
+
     // Declared after the threads and before they start, so exception unwinding
     // always interrupts I/O and joins workers before Network is destroyed.
     struct SessionCleanup
@@ -28,37 +46,83 @@ namespace
     };
 }
 
-int main()
+int main(int argc, char* argv[])
 {
+    const bool interactive = argc == 1;
+    int choice = 0;
+    uint16_t port = 9000;
+    std::string ip, bindIp = "0.0.0.0";
+    if (argc == 2 && std::string_view(argv[1]) == "--version")
+    {
+        PrintVersion();
+        return 0;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--help")
+    {
+        PrintUsage();
+        return 0;
+    }
+    bool valid = true, hasPort = false, hasBind = false;
+    for (int i = 1; i < argc && valid; ++i)
+    {
+        const std::string_view arg(argv[i]);
+        if (arg == "--host" && choice == 0) choice = 1;
+        else if (arg == "--connect" && choice == 0 && i + 1 < argc)
+        {
+            choice = 2;
+            ip = argv[++i];
+        }
+        else if (arg == "--bind" && !hasBind && i + 1 < argc)
+        {
+            hasBind = true;
+            bindIp = argv[++i];
+        }
+        else if (arg == "--port" && !hasPort && i + 1 < argc)
+        {
+            hasPort = true;
+            const std::string_view value(argv[++i]);
+            unsigned number = 0;
+            const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
+            valid = result.ec == std::errc{} && result.ptr == value.data() + value.size() &&
+                number > 0 && number <= 65535;
+            if (valid) port = static_cast<uint16_t>(number);
+        }
+        else valid = false;
+    }
+    if (!interactive && (!valid || choice == 0 || (hasBind && choice != 1)))
+    {
+        std::cerr << "Invalid command line\n";
+        PrintUsage();
+        return 1;
+    }
+
     Network network;
 
     if (!network.Initialize())
         return 1;
 
     std::cout << "=== FileTransferApp ===\n";
-    std::cout << "1. Host\n";
-    std::cout << "2. Connect\n";
-    std::cout << "Select: ";
-
-    int choice = 0;
-
-    if (!(std::cin >> choice))
-        return 1;
+    PrintVersion();
+    if (interactive)
+    {
+        std::cout << "1. Host\n2. Connect\nSelect: ";
+        if (!(std::cin >> choice)) return 1;
+    }
 
     bool connected = false;
 
     if (choice == 1)
     {
-        connected = network.StartServer(9000);
+        connected = network.StartServer(port, bindIp);
     }
     else if (choice == 2)
     {
-        std::string ip;
-
-        std::cout << "IP: ";
-        std::cin >> ip;
-
-        connected = network.Connect(ip, 9000);
+        if (interactive)
+        {
+            std::cout << "IP: ";
+            std::cin >> ip;
+        }
+        connected = network.Connect(ip, port);
     }
 
     if (!connected)
@@ -73,9 +137,8 @@ int main()
     {
         receiver = std::thread(&Network::ReceiveLoop, &network);
 
-        std::cin.ignore(
-            std::numeric_limits<std::streamsize>::max(),
-            '\n');
+        if (interactive)
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
         std::cout << "\nCommands:\n"
             << "  /file <path>  Send file\n"
