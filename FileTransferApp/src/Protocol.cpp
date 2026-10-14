@@ -109,45 +109,93 @@ std::string Protocol::MakeFileBegin(
     return payload;
 }
 
-std::vector<std::string> Protocol::TakeCompletedFiles()
+std::string Protocol::WithRequestId(uint64_t id, std::string_view payload)
 {
-    std::vector<std::string> result;
-    result.swap(completedFiles_);
+    if (!id) throw std::invalid_argument("Zero request ID");
+    std::string result;
+    AppendU64(result, id);
+    result.append(payload);
     return result;
+}
+
+void Protocol::Configure(bool host)
+{
+    host_ = host;
+    nextId_ = host ? 1 : 2;
+}
+
+uint64_t Protocol::StartOutgoing(const std::string& name)
+{
+    if (sendState_ == SendState::AwaitAccept || sendState_ == SendState::Sending ||
+        sendState_ == SendState::AwaitAck || nextId_ == 0) return 0;
+    outgoingId_ = nextId_;
+    // Never wrap and reuse IDs on this connection.
+    nextId_ = nextId_ > UINT64_MAX - 2 ? 0 : nextId_ + 2;
+    outgoingName_ = name;
+    sendState_ = SendState::AwaitAccept;
+    sendDeadline_ = Clock::now() + APPROVAL_TIMEOUT;
+    return outgoingId_;
+}
+
+bool Protocol::AwaitAck()
+{
+    if (sendState_ != SendState::Sending) return false;
+    sendState_ = SendState::AwaitAck;
+    sendDeadline_ = Clock::now() + TRANSFER_TIMEOUT;
+    return true;
+}
+
+void Protocol::FailOutgoing(const char* reason)
+{
+    if (sendState_ == SendState::AwaitAccept || sendState_ == SendState::Sending ||
+        sendState_ == SendState::AwaitAck)
+    {
+        sendState_ = SendState::Failed;
+        replies_.push_back({ MessageType::FileError, outgoingId_, reason });
+    }
 }
 
 bool Protocol::TakeFileRequest(IncomingFileRequest& out)
 {
-    if (!hasPendingRequest_)
-        return false;
-
-    out = pendingRequest_;
+    if (receiveState_ != ReceiveState::PendingApproval) return false;
+    out = incoming_;
     return true;
 }
 
-bool Protocol::ApproveFileRequest()
+uint64_t Protocol::ApproveFileRequest()
 {
-    if (!hasPendingRequest_ || hasApprovedRequest_)
-        return false;
-
-    approvedRequest_ = pendingRequest_;
-    hasApprovedRequest_ = true;
-    hasPendingRequest_ = false;
-
-    return true;
+    if (receiveState_ != ReceiveState::PendingApproval) return 0;
+    receiveState_ = ReceiveState::AwaitBegin;
+    receiveDeadline_ = Clock::now() + TRANSFER_TIMEOUT;
+    return incomingId_;
 }
 
-void Protocol::RejectFileRequest()
+uint64_t Protocol::RejectFileRequest()
 {
-    hasPendingRequest_ = false;
-    pendingRequest_ = {};
+    if (receiveState_ != ReceiveState::PendingApproval) return 0;
+    const auto id = incomingId_;
+    ClearIncoming();
+    return id;
 }
 
-Protocol::FileDecision Protocol::TakeFileDecision()
+std::vector<Protocol::Reply> Protocol::TakeReplies()
 {
-    FileDecision result = fileDecision_;
-    fileDecision_ = FileDecision::None;
+    std::vector<Reply> result;
+    result.swap(replies_);
     return result;
+}
+
+void Protocol::CheckTimeouts()
+{
+    if ((sendState_ == SendState::AwaitAccept || sendState_ == SendState::AwaitAck) &&
+        Clock::now() >= sendDeadline_)
+        FailOutgoing(sendState_ == SendState::AwaitAccept ? "Approval timed out" : "ACK timed out");
+    if (receiveState_ != ReceiveState::Idle && Clock::now() >= receiveDeadline_)
+    {
+        replies_.push_back({ MessageType::FileError, incomingId_, "Receive request timed out" });
+        std::cerr << "Receive request timed out\n" << std::flush;
+        ClearIncoming();
+    }
 }
 
 bool Protocol::Feed(std::string_view bytes)
@@ -199,94 +247,138 @@ bool Protocol::Feed(std::string_view bytes)
     return true;
 }
 
-bool Protocol::ProcessMessage(
-    MessageType type,
-    std::string_view payload)
+bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
 {
-    switch (type)
+    if (type == MessageType::Text)
     {
-    case MessageType::Text:
         std::cout << "\n[Received TEXT] ";
         std::cout.write(payload.data(), payload.size());
         std::cout << "\n> " << std::flush;
         return true;
+    }
+    if (type < MessageType::FileBegin || type > MessageType::FileError) return false;
+    // IDs are mandatory for every file message; old wire format is not accepted.
+    if (payload.size() < 8) return false;
+    const uint64_t id = ReadU64(payload.substr(0, 8));
+    payload.remove_prefix(8);
+    if (!id) return false;
 
+    if (type == MessageType::FileAccept || type == MessageType::FileReject ||
+        type == MessageType::FileAck || type == MessageType::FileError)
+    {
+        const bool error = type == MessageType::FileError;
+        if (error)
+        {
+            if (payload.empty() || payload.size() > 256 ||
+                std::any_of(payload.begin(), payload.end(),
+                    [](unsigned char c) { return c < 32 || c > 126; })) return false;
+            if (id == incomingId_ && receiveState_ != ReceiveState::Idle)
+            {
+                std::cerr << "\n[Peer file error] " << payload << '\n' << std::flush;
+                ClearIncoming();
+                return true; // Never reply to FILE_ERROR.
+            }
+        }
+        else if (!payload.empty()) return false;
+
+        const bool active = sendState_ == SendState::AwaitAccept ||
+            sendState_ == SendState::Sending || sendState_ == SendState::AwaitAck;
+        if (id != outgoingId_ || !active)
+        {
+            std::cout << "\n[Ignored stale file response] " << id << '\n' << std::flush;
+            return true;
+        }
+        if (error)
+        {
+            std::cerr << "\n[Peer file error] " << payload << '\n' << std::flush;
+            sendState_ = SendState::Failed;
+            return true;
+        }
+        if (type == MessageType::FileAccept && sendState_ == SendState::AwaitAccept)
+            sendState_ = SendState::Sending;
+        else if (type == MessageType::FileReject && sendState_ == SendState::AwaitAccept)
+            sendState_ = SendState::Failed;
+        else if (type == MessageType::FileAck && sendState_ == SendState::AwaitAck)
+        {
+            sendState_ = SendState::Completed;
+        }
+        else
+        {
+            // Same ID is insufficient: duplicate ACCEPT/early ACK/late REJECT
+            // in an active transfer is a protocol violation.
+            FailOutgoing("Invalid sender state transition");
+            return false;
+        }
+        return true;
+    }
+
+    if (type == MessageType::FileRequest)
+    {
+        // The originator owns a parity namespace. A monotonic watermark prevents
+        // replay without retaining an unbounded set of completed IDs.
+        if ((id & 1) == (host_ ? 1ULL : 0ULL) || id <= lastIncomingId_)
+        {
+            replies_.push_back({ MessageType::FileError, id, "Invalid or replayed request ID" });
+            return false;
+        }
+        if (receiveState_ != ReceiveState::Idle)
+        {
+            replies_.push_back({ MessageType::FileError, id, "Receiver busy" });
+            return false;
+        }
+        incomingId_ = id;
+        lastIncomingId_ = id;
+        if (payload.size() < 9) return FailFile("Invalid file metadata");
+        const auto size = ReadU64(payload.substr(0, 8));
+        const std::string name(payload.substr(8));
+        if (size > MAX_FILE_SIZE || !IsSafeFileName(name)) return FailFile("Invalid file metadata");
+        incoming_ = { name, size, id };
+        receiveState_ = ReceiveState::PendingApproval;
+        receiveDeadline_ = Clock::now() + APPROVAL_TIMEOUT;
+        std::cout << "\n[Incoming file request] " << name << " (" << size
+            << " bytes)\nType /accept or /reject\n> " << std::flush;
+        return true;
+    }
+
+    if (id != incomingId_ || receiveState_ == ReceiveState::Idle)
+    {
+        replies_.push_back({ MessageType::FileError, id, "No matching active receive request" });
+        return false;
+    }
+    bool valid = false;
+    switch (type)
+    {
     case MessageType::FileBegin:
-        return BeginFile(payload);
-
+        if (receiveState_ != ReceiveState::AwaitBegin) return FailFile("Unexpected FILE_BEGIN");
+        valid = BeginFile(payload);
+        if (valid) receiveState_ = ReceiveState::Receiving;
+        break;
     case MessageType::FileChunk:
-        return WriteFileChunk(payload);
-
+        if (receiveState_ != ReceiveState::Receiving || payload.empty())
+            return FailFile("Unexpected FILE_CHUNK");
+        valid = WriteFileChunk(payload);
+        break;
     case MessageType::FileEnd:
-        return payload.empty() ? EndFile() : FailFile("Invalid FILE_END payload");
-
-    case MessageType::FileError:
-        if (payload.empty() || payload.size() > 256 ||
-            std::any_of(payload.begin(), payload.end(),
-                [](unsigned char c) { return c < 32 || c > 126; }))
-            return false;
-        std::cerr << "\n[Peer file error] " << payload << '\n';
-        // No request IDs yet: terminate rather than misattribute the failure.
-        return false;
-
-    case MessageType::FileAck:
-    {
-        std::cout << "\n[Transfer completed] ";
-
-        std::cout.write(
-            payload.data(),
-            static_cast<std::streamsize>(payload.size()));
-
-        std::cout << "\n> " << std::flush;
-        return true;
+        if (receiveState_ != ReceiveState::Receiving || !payload.empty())
+            return FailFile("Unexpected FILE_END");
+        valid = EndFile();
+        if (valid)
+        {
+            replies_.push_back({ MessageType::FileAck, id, {} });
+            ClearIncoming();
+        }
+        break;
+    default: return false;
     }
-    case MessageType::FileRequest:
-    {
-        if (receivingFile_ ||
-            hasPendingRequest_ ||
-            hasApprovedRequest_ ||
-            payload.size() < 9)
-            return FailFile("Invalid file request or receiver busy");
-
-        uint64_t fileSize = ReadU64(payload.substr(0, 8));
-        std::string fileName(payload.substr(8));
-
-        if (fileSize > MAX_FILE_SIZE ||
-            !IsSafeFileName(fileName))
-            return FailFile("Invalid file metadata");
-
-        pendingRequest_ = { fileName, fileSize };
-        hasPendingRequest_ = true;
-
-        std::cout << "\n[Incoming file request] "
-            << fileName << " (" << fileSize << " bytes)\n"
-            << "Type /accept or /reject\n> "
-            << std::flush;
-
-        return true;
-    }
-
-    case MessageType::FileAccept:
-        if (!payload.empty())
-            return false;
-        fileDecision_ = FileDecision::Accept;
-        return true;
-
-    case MessageType::FileReject:
-        if (!payload.empty())
-            return false;
-        fileDecision_ = FileDecision::Reject;
-        return true;
-    default:
-        std::cerr << "Unknown message type\n";
-        return false;
-    }
+    if (valid && receiveState_ != ReceiveState::Idle)
+        receiveDeadline_ = Clock::now() + TRANSFER_TIMEOUT;
+    return valid;
 }
 
 bool Protocol::BeginFile(std::string_view payload)
 {
     // All remote-controlled state and metadata checks precede any disk change.
-    if (receivingFile_ || file_ || ownsTemp_ || !hasApprovedRequest_ || hasPendingRequest_)
+    if (receivingFile_ || file_ || ownsTemp_ || receiveState_ != ReceiveState::AwaitBegin)
         return FailFile("File transfer not approved or receiver busy");
     if (payload.size() < 9)
         return FailFile("Invalid file metadata");
@@ -294,7 +386,7 @@ bool Protocol::BeginFile(std::string_view payload)
     const std::string fileName(payload.substr(8));
     if (fileSize > MAX_FILE_SIZE || !IsSafeFileName(fileName))
         return FailFile("Invalid file metadata");
-    if (fileSize != approvedRequest_.fileSize || fileName != approvedRequest_.fileName)
+    if (fileSize != incoming_.fileSize || fileName != incoming_.fileName)
         return FailFile("File metadata mismatch");
 
     std::error_code ec;
@@ -335,8 +427,6 @@ bool Protocol::BeginFile(std::string_view payload)
     expectedSize_ = fileSize;
     receivedSize_ = 0;
     receivingFile_ = true;
-    hasApprovedRequest_ = false;
-    approvedRequest_ = {};
     std::cout << "\n[Receiving] " << fileName
         << " (" << expectedSize_ << " bytes)\n" << std::flush;
     return true;
@@ -382,7 +472,7 @@ bool Protocol::EndFile()
     CloseHandle(directory_);
     directory_ = nullptr;
     receivingFile_ = false;
-    completedFiles_.push_back(finalPath_.filename().string());
+
     std::cout << "\n[File saved] " << finalPath_.string() << "\n> " << std::flush;
     return true;
 }
@@ -410,37 +500,28 @@ void Protocol::AbortFile()
     finalPath_.clear();
 }
 
+void Protocol::ClearIncoming()
+{
+    AbortFile();
+    receiveState_ = ReceiveState::Idle;
+    incomingId_ = 0;
+    incoming_ = {};
+}
+
 bool Protocol::FailFile(const char* reason)
 {
-    fileError_ = reason;
-    AbortFile();
-    hasPendingRequest_ = hasApprovedRequest_ = false;
-    pendingRequest_ = approvedRequest_ = {};
-    std::cerr << "File receive failed: " << reason << '\n';
+    if (incomingId_) replies_.push_back({ MessageType::FileError, incomingId_, reason });
+    ClearIncoming();
+    std::cerr << "File receive failed: " << reason << '\n' << std::flush;
     return false;
 }
 
-std::string Protocol::TakeFileError()
-{
-    std::string result;
-    result.swap(fileError_);
-    return result;
-}
-Protocol::~Protocol()
-{
-    AbortFile();
-}
+Protocol::~Protocol() { AbortFile(); }
 
 void Protocol::ResetConnection()
 {
-    AbortFile();
-    fileError_.clear();
+    ClearIncoming();
+    if (sendState_ != SendState::Completed) sendState_ = SendState::Failed;
+    replies_.clear();
     buffer_.clear();
-    completedFiles_.clear();
-    hasPendingRequest_ = false;
-    pendingRequest_ = {};
-    hasApprovedRequest_ = false;
-    approvedRequest_ = {};
-    fileDecision_ = FileDecision::None;
-    expectedSize_ = receivedSize_ = 0;
 }

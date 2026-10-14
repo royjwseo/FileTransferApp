@@ -1,4 +1,4 @@
-param([string]$Exe = "$PSScriptRoot/../FileTransferApp/x64/Debug/FileTransferApp.exe")
+﻿param([string]$Exe = "$PSScriptRoot/../x64/Debug/FileTransferApp.exe")
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/stage1.ps1" -Exe $Exe -HelpersOnly
 
@@ -126,7 +126,7 @@ foreach ($size in @(0,1MB)) {
         Write-Frame $c.Peer 4 @()
         $ack = Read-Frame $c.Peer
         Assert ($ack.Type -eq 5) 'Expected FILE_ACK after commit'
-        Assert ([Text.Encoding]::ASCII.GetString($ack.Payload) -eq 'normal.bin') 'Wrong ACK'
+        Assert ($ack.RequestId -eq 1 -and $ack.Payload.Length -eq 0) 'Wrong ACK request ID or payload'
         $source = Join-Path $runDir ("source-$size.bin")
         [IO.File]::WriteAllBytes($source,$data)
         $saved = Join-Path $c.App.Process.StartInfo.WorkingDirectory 'received/normal.bin'

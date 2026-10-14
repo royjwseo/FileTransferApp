@@ -1,4 +1,4 @@
-param([string]$Exe = "$PSScriptRoot/../FileTransferApp/x64/Debug/FileTransferApp.exe", [switch]$HelpersOnly)
+﻿param([string]$Exe = "$PSScriptRoot/../x64/Debug/FileTransferApp.exe", [switch]$HelpersOnly)
 $ErrorActionPreference = 'Stop'
 $Exe = (Resolve-Path $Exe).Path
 # Each invocation owns its processes and files; existing received files are untouched.
@@ -90,9 +90,35 @@ function Read-Frame($peer) {
     $h = Read-Exact $stream 5
     $length = ([int]$h[1] -shl 24) -bor ([int]$h[2] -shl 16) -bor ([int]$h[3] -shl 8) -bor [int]$h[4]
     $payload = Read-Exact $stream $length
-    return @{ Type=$h[0]; Payload=$payload }
+    [UInt64]$id = 0
+    if ($h[0] -ge 2 -and $h[0] -le 9) {
+        Assert ($payload.Length -ge 8) 'File message missing request ID'
+        $id = Read-U64 $payload
+        $payload = [byte[]]@($payload | Select-Object -Skip 8)
+        if ($h[0] -eq 6) { $script:outgoingIds[$peer.GetHashCode()] = $id }
+    }
+    return @{ Type=$h[0]; Payload=$payload; RequestId=$id }
 }
-function Write-Frame($peer,[byte]$type,[byte[]]$payload) {
+$script:outgoingIds = @{}
+function U64-Bytes([UInt64]$value) {
+    [byte[]]$bytes = New-Object byte[] 8
+    for ($i = 0; $i -lt 8; $i++) { $bytes[$i] = ($value -shr ((7-$i)*8)) -band 255 }
+    return ,$bytes
+}
+function Read-U64([byte[]]$bytes) {
+    [UInt64]$value = 0
+    for ($i = 0; $i -lt 8; $i++) { $value = ($value -shl 8) -bor $bytes[$i] }
+    return $value
+}
+function Write-Frame($peer,[byte]$type,[byte[]]$payload,[UInt64]$RequestId = 0,[switch]$NoId) {
+    if ($type -ge 2 -and $type -le 9 -and !$NoId) {
+        if (!$RequestId) {
+            if ($type -in @(5,7,8,9) -and $script:outgoingIds.ContainsKey($peer.GetHashCode())) {
+                $RequestId = $script:outgoingIds[$peer.GetHashCode()]
+            } else { $RequestId = 1 }
+        }
+        $payload = [byte[]]((U64-Bytes $RequestId) + $payload)
+    }
     $n = $payload.Length
     [byte[]]$header = @($type, (($n -shr 24) -band 255), (($n -shr 16) -band 255), (($n -shr 8) -band 255), ($n -band 255))
     $stream = $peer.GetStream()

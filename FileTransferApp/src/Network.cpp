@@ -1,4 +1,5 @@
-﻿
+﻿#define NOMINMAX
+
 #include "Network.h"
 
 #include <iostream>
@@ -75,7 +76,7 @@ bool Network::StartServer(uint16_t port)
         return false;
     }
 
-    if (!AdoptSocket(accepted)) return false;
+    if (!AdoptSocket(accepted, true)) return false;
     std::cout << "Client connected.\n";
     return true;
 }
@@ -109,7 +110,7 @@ bool Network::Connect(const std::string& ip, uint16_t port)
         return false;
     }
 
-    if (!AdoptSocket(candidate)) return false;
+    if (!AdoptSocket(candidate, false)) return false;
     std::cout << "Connected to " << ip << ':' << port << '\n';
     return true;
 }
@@ -142,65 +143,22 @@ void Network::ReceiveLoop()
 
             if (n > 0)
             {
-                std::vector<std::string> completedFiles;
-
-                Protocol::FileDecision decision =
-                    Protocol::FileDecision::None;
-                bool valid = false;
-                std::string fileError;
-
+                bool valid;
+                std::vector<Protocol::Reply> replies;
                 {
                     std::lock_guard<std::mutex> lock(protocolMutex_);
-
-                    // 수신된 바이트를 프레이밍 및 파싱
-                    valid = protocol_.Feed(
-                        std::string_view(buffer, static_cast<size_t>(n)));
-                    fileError = protocol_.TakeFileError();
-
-                    // 파일 저장 완료 목록
-                    completedFiles = protocol_.TakeCompletedFiles();
-
-                    // 상대방 승인 또는 거절 결과
-                    decision = protocol_.TakeFileDecision();
+                    // Expire requests before processing new bytes as well as
+                    // on recv timeouts: continuous text cannot prevent expiry.
+                    protocol_.CheckTimeouts();
+                    valid = protocol_.Feed(std::string_view(buffer, static_cast<size_t>(n)));
+                    replies = protocol_.TakeReplies();
                 }
-
+                approvalCv_.notify_all();
+                if (!SendReplies(std::move(replies))) break;
                 if (!valid)
                 {
-                    // Send after releasing protocolMutex_, before shutdown.
-                    // A failed notice still follows the normal stop/join path.
-                    if (!fileError.empty()) SendFrame(MessageType::FileError, fileError);
                     std::cerr << "Protocol error\n";
                     break;
-                }
-
-                // FILE_ACCEPT / FILE_REJECT 처리
-                if (decision != Protocol::FileDecision::None)
-                {
-                    {
-                        std::lock_guard<std::mutex> lock(approvalMutex_);
-
-                        if (waitingForApproval_)
-                        {
-                            approved_ =
-                                decision == Protocol::FileDecision::Accept;
-
-                            approvalReceived_ = true;
-                        }
-                    }
-
-                    // 승인 대기 중인 SendFile() 깨우기
-                    approvalCv_.notify_one();
-                }
-
-                // 수신 파일 저장 완료 후 ACK 전송
-                for (const auto& fileName : completedFiles)
-                {
-                    if (!SendFrame(MessageType::FileAck, fileName))
-                    {
-                        std::cerr << "Failed to send ACK\n";
-                        RequestStop();
-                        break;
-                    }
                 }
             }
             else if (n == 0)
@@ -213,7 +171,16 @@ void Network::ReceiveLoop()
                 // A quiet connection is valid. Recheck stop periodically even
                 // when shutdown does not release an already pending recv.
                 if (receiveError == WSAETIMEDOUT || receiveError == WSAEWOULDBLOCK)
+                {
+                    std::vector<Protocol::Reply> replies;
+                    {
+                        std::lock_guard<std::mutex> lock(protocolMutex_);
+                        protocol_.CheckTimeouts();
+                        replies = protocol_.TakeReplies();
+                    }
+                    if (!SendReplies(std::move(replies))) break;
                     continue;
+                }
                 std::cerr << "\nrecv failed: "
                     << receiveError << '\n';
                 break;
@@ -263,7 +230,7 @@ SOCKET Network::ConnectedSocket()
     return stopping_ ? INVALID_SOCKET : socket_;
 }
 
-bool Network::AdoptSocket(SOCKET connected)
+bool Network::AdoptSocket(SOCKET connected, bool host)
 {
     const DWORD receiveTimeoutMs = 250;
     const DWORD sendTimeoutMs = 2000;
@@ -285,7 +252,7 @@ bool Network::AdoptSocket(SOCKET connected)
     }
     socket_ = connected;
     stopping_ = false;
-    std::lock_guard<std::mutex> approvalLock(approvalMutex_);
+    protocol_.Configure(host);
     approvalCancelled_ = false;
     return true;
 }
@@ -400,56 +367,27 @@ bool Network::SendFile(const std::string& path)
         return false;
     }
 
-    // 이 잠금은 SendFile() 함수 시작에서 획득해야 함.
-// std::lock_guard<std::mutex> fileLock(fileSendMutex_);
-
+    uint64_t id;
     {
-        std::lock_guard<std::mutex> lock(approvalMutex_);
-
+        std::lock_guard<std::mutex> lock(protocolMutex_);
         if (approvalCancelled_) return false;
-        waitingForApproval_ = true;
-        approvalReceived_ = false;
-        approved_ = false;
-
+        id = protocol_.StartOutgoing(fileName);
     }
-
-    // 파일 전송 요청
-    if (!SendFrame(MessageType::FileRequest, metadata))
-    {
-        std::lock_guard<std::mutex> lock(approvalMutex_);
-        waitingForApproval_ = false;
-        return false;
-    }
-
+    if (!id) return false;
+    const auto identifiedMetadata = Protocol::WithRequestId(id, metadata);
+    if (!SendFrame(MessageType::FileRequest, identifiedMetadata)) return false;
     std::cout << "\nWaiting for file approval...\n" << std::flush;
-
+    if (!WaitForState(Protocol::SendState::AwaitAccept, Protocol::APPROVAL_TIMEOUT))
     {
-        std::unique_lock<std::mutex> lock(approvalMutex_);
-
-        bool signaled = approvalCv_.wait_for(
-            lock,
-            std::chrono::seconds(60),
-            [this]
-            {
-                return approvalReceived_ || approvalCancelled_;
-            });
-
-        bool canSend =
-            signaled && !approvalCancelled_ && approved_;
-
-        waitingForApproval_ = false;
-
-        if (!canSend)
-        {
-            std::cerr << "File rejected, cancelled, or timed out\n";
-            return false;
-        }
-    }
-
-    // 승인된 경우에만 파일 본문 전송
-    if (!SendFrame(MessageType::FileBegin, metadata))
+        std::cerr << "File rejected, cancelled, or timed out\n";
         return false;
-
+    }
+    {
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        if (protocol_.OutgoingState() != Protocol::SendState::Sending || approvalCancelled_)
+            return false;
+    }
+    if (!SendFrame(MessageType::FileBegin, identifiedMetadata)) return false;
     std::array<char, CHUNK_SIZE> buffer;
     uint64_t sentBytes = 0;
 
@@ -465,6 +403,10 @@ bool Network::SendFile(const std::string& path)
 
         if (bytesRead != static_cast<std::streamsize>(toRead))
         {
+            {
+                std::lock_guard<std::mutex> lock(protocolMutex_);
+                protocol_.FailOutgoing("File read failed");
+            }
             std::cerr << "File read failed\n";
             return false;
         }
@@ -473,7 +415,14 @@ bool Network::SendFile(const std::string& path)
             buffer.data(),
             static_cast<size_t>(bytesRead));
 
-        if (!SendFrame(MessageType::FileChunk, chunk))
+        {
+            std::lock_guard<std::mutex> lock(protocolMutex_);
+            if (approvalCancelled_ || protocol_.OutgoingState() != Protocol::SendState::Sending)
+                return false;
+        }
+        // Never hold the state lock during socket I/O: the peer may be sending
+        // concurrently and needs our receiver to drain the other direction.
+        if (!SendFrame(MessageType::FileChunk, Protocol::WithRequestId(id, chunk)))
             return false;
 
         sentBytes += static_cast<uint64_t>(bytesRead);
@@ -483,58 +432,79 @@ bool Network::SendFile(const std::string& path)
             << " bytes" << std::flush;
     }
 
-    // 파일 전송 완료 메시지
-    if (!SendFrame(MessageType::FileEnd, {}))
-        return false;
-
-    std::cout << "\n[Upload finished, waiting for ACK] "
-        << fileName << '\n';
-
+    {
+        // Publish ACK-wait before END so an immediate response cannot be lost.
+        // No state lock is held during I/O, including the small END frame.
+        std::lock_guard<std::mutex> lock(protocolMutex_);
+        if (approvalCancelled_ || !protocol_.AwaitAck()) return false;
+    }
+    if (!SendFrame(MessageType::FileEnd, Protocol::WithRequestId(id))) return false;
+    std::cout << "\n[Upload finished, waiting for ACK] " << fileName << '\n' << std::flush;
+    if (!WaitForState(Protocol::SendState::AwaitAck, Protocol::TRANSFER_TIMEOUT)) return false;
+    std::cout << "\n[Transfer completed] " << fileName << "\n> " << std::flush;
     return true;
 }
 
+bool Network::WaitForState(Protocol::SendState waiting, std::chrono::seconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    std::unique_lock<std::mutex> lock(protocolMutex_);
+    while (!approvalCancelled_ && protocol_.OutgoingState() == waiting)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            protocol_.FailOutgoing(waiting == Protocol::SendState::AwaitAccept ?
+                "Approval timed out" : "ACK timed out");
+            auto replies = protocol_.TakeReplies();
+            lock.unlock();
+            SendReplies(std::move(replies));
+            return false;
+        }
+        // Stop notification does not need the state lock (SendFrame may hold it).
+        // Bound the possible notification race to the receive polling interval.
+        approvalCv_.wait_until(lock, std::min(deadline,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(250)));
+    }
+    if (approvalCancelled_) return false;
+    const auto state = protocol_.OutgoingState();
+    return waiting == Protocol::SendState::AwaitAccept ?
+        state == Protocol::SendState::Sending : state == Protocol::SendState::Completed;
+}
+
+bool Network::SendReplies(std::vector<Protocol::Reply> replies)
+{
+    for (const auto& reply : replies)
+        if (!SendFrame(reply.type, Protocol::WithRequestId(reply.requestId, reply.payload)))
+            return false;
+    return true;
+}
 
 bool Network::AcceptFile()
 {
+    uint64_t id;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
-
-        if (!protocol_.ApproveFileRequest())
-        {
-            std::cout << "No pending file request\n";
-            return false;
-        }
+        protocol_.CheckTimeouts();
+        id = protocol_.ApproveFileRequest();
     }
-
-    return SendFrame(MessageType::FileAccept, {});
+    if (!id) { std::cout << "No pending file request\n"; return false; }
+    return SendFrame(MessageType::FileAccept, Protocol::WithRequestId(id));
 }
 
 bool Network::RejectFile()
 {
+    uint64_t id;
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
-
-        Protocol::IncomingFileRequest request;
-
-        if (!protocol_.TakeFileRequest(request))
-        {
-            std::cout << "No pending file request\n";
-            return false;
-        }
-
-        protocol_.RejectFileRequest();
+        protocol_.CheckTimeouts();
+        id = protocol_.RejectFileRequest();
     }
-
-    return SendFrame(MessageType::FileReject, {});
+    if (!id) { std::cout << "No pending file request\n"; return false; }
+    return SendFrame(MessageType::FileReject, Protocol::WithRequestId(id));
 }
 
 void Network::CancelPendingApproval()
 {
-    {
-        std::lock_guard<std::mutex> lock(approvalMutex_);
-
-        approvalCancelled_ = true;
-    }
-
+    approvalCancelled_ = true;
     approvalCv_.notify_all();
 }

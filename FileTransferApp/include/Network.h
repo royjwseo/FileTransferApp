@@ -5,6 +5,7 @@
 #include <ws2tcpip.h>
 
 #include <mutex>
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <condition_variable>
@@ -49,7 +50,7 @@ private:
     bool stopping_ = true;
     std::mutex socketMutex_;
     std::mutex receiveMutex_;
-    bool AdoptSocket(SOCKET socket);
+    bool AdoptSocket(SOCKET socket, bool host);
     SOCKET ConnectedSocket(); // Caller holds sendMutex_ or receiveMutex_.
     bool initialized_ = false;
 
@@ -60,15 +61,12 @@ private:
     // Protocol 상태 접근 보호
     std::mutex protocolMutex_;
 
-    // 상대방의 승인 응답 대기
-    std::mutex approvalMutex_;
+    // State lives in Protocol under protocolMutex_. Cancellation is atomic so
+    // SendFrame can request stop while the state lock is held.
     std::condition_variable approvalCv_;
-
-    bool waitingForApproval_ = false;
-    bool approvalReceived_ = false;
-    bool approved_ = false;
-    bool approvalCancelled_ = false;
-
+    std::atomic<bool> approvalCancelled_{ true };
+    bool SendReplies(std::vector<Protocol::Reply> replies);
+    bool WaitForState(Protocol::SendState waiting, std::chrono::seconds timeout);
     // 송신 중 중복 파일 요청 방지
     std::mutex fileSendMutex_;
 };
