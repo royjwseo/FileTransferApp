@@ -2,6 +2,7 @@
 #include <atomic>
 #include <charconv>
 #include <iostream>
+#include <syncstream>
 #include <exception>
 #include <limits>
 #include <string>
@@ -14,16 +15,16 @@ namespace
 {
     void PrintVersion()
     {
-        std::cout << "FileTransferApp protocol=" << Protocol::WIRE_VERSION
+        std::osyncstream(std::cout) << "FileTransferApp protocol=" << Protocol::WIRE_VERSION
             << " requestId64-parity maxFileBytes=" << Protocol::MAX_FILE_SIZE << '\n';
     }
 
     void PrintUsage()
     {
-        std::cout << "Usage:\n"
+        std::osyncstream(std::cout) << "Usage:\n"
             << "  FileTransferApp.exe                         Interactive menu, port 9000\n"
-            << "  FileTransferApp.exe --host [--bind IPv4] [--port 1..65535]\n"
-            << "  FileTransferApp.exe --connect IPv4 [--port 1..65535]\n"
+            << "  FileTransferApp.exe --host [--bind IPv4] [--port 1..65535] [--reconnect]\n"
+            << "  FileTransferApp.exe --connect IPv4 [--port 1..65535] [--reconnect]\n"
             << "  FileTransferApp.exe --version\n"
             << "  FileTransferApp.exe --help\n";
     }
@@ -62,11 +63,12 @@ int main(int argc, char* argv[])
         PrintUsage();
         return 0;
     }
-    bool valid = true, hasPort = false, hasBind = false;
+    bool valid = true, hasPort = false, hasBind = false, autoReconnect = false;
     for (int i = 1; i < argc && valid; ++i)
     {
         const std::string_view arg(argv[i]);
-        if (arg == "--host" && choice == 0) choice = 1;
+        if (arg == "--reconnect" && !autoReconnect) autoReconnect = true;
+        else if (arg == "--host" && choice == 0) choice = 1;
         else if (arg == "--connect" && choice == 0 && i + 1 < argc)
         {
             choice = 2;
@@ -101,11 +103,11 @@ int main(int argc, char* argv[])
     if (!network.Initialize())
         return 1;
 
-    std::cout << "=== FileTransferApp ===\n";
+    std::osyncstream(std::cout) << "=== FileTransferApp ===\n";
     PrintVersion();
     if (interactive)
     {
-        std::cout << "1. Host\n2. Connect\nSelect: ";
+        std::osyncstream(std::cout) << "1. Host\n2. Connect\nSelect: ";
         if (!(std::cin >> choice)) return 1;
     }
 
@@ -119,7 +121,7 @@ int main(int argc, char* argv[])
     {
         if (interactive)
         {
-            std::cout << "IP: ";
+            std::osyncstream(std::cout) << "IP: ";
             std::cin >> ip;
         }
         connected = network.Connect(ip, port);
@@ -127,6 +129,7 @@ int main(int argc, char* argv[])
 
     if (!connected)
         return 1;
+    network.EnableAutoReconnect(autoReconnect);
 
     std::thread receiver;
     std::thread fileSender;
@@ -140,10 +143,14 @@ int main(int argc, char* argv[])
         if (interactive)
             std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
-        std::cout << "\nCommands:\n"
+        std::osyncstream(std::cout) << "\nCommands:\n"
             << "  /file <path>  Send file\n"
+            << "  /resume <transferId> <path> Resume owned partial file\n"
+            << "  /status <transferId> <path> Verify prior commit\n"
             << "  /accept       Accept incoming file\n"
             << "  /reject       Reject incoming file\n"
+            << "  /cancel [requestId] Cancel one active file transfer\n"
+            << "  /reconnect    Reconnect to the same endpoint\n"
             << "  /quit         Exit\n"
             << "  other text    Send text\n\n";
 
@@ -154,7 +161,38 @@ int main(int argc, char* argv[])
             if (message == "/quit")
                 break;
 
-            if (message == "/accept")
+            if (message == "/reconnect")
+            {
+                if (network.IsConnected() || network.AutoReconnectEnabled())
+                {
+                    std::osyncstream(std::cout) << "Already connected or automatic reconnect enabled\n" << std::flush;
+                    continue;
+                }
+                if (fileSender.joinable()) fileSender.join();
+                if (receiver.joinable()) receiver.join();
+                if (network.Reconnect())
+                {
+                    std::osyncstream(std::cout) << "[Reconnected] new requestId session\n" << std::flush;
+                    receiver = std::thread(&Network::ReceiveLoop, &network);
+                }
+                else std::osyncstream(std::cout) << "Reconnect failed\n" << std::flush;
+            }
+            else if (message == "/cancel" || message.rfind("/cancel ", 0) == 0)
+            {
+                uint64_t id = 0;
+                if (message != "/cancel")
+                {
+                    const std::string_view value(message.data() + 8, message.size() - 8);
+                    const auto result = std::from_chars(value.data(), value.data() + value.size(), id);
+                    if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || !id)
+                    {
+                        std::osyncstream(std::cout) << "Invalid requestId\n";
+                        continue;
+                    }
+                }
+                network.CancelFile(id);
+            }
+            else if (message == "/accept")
             {
                 network.AcceptFile();
             }
@@ -162,12 +200,13 @@ int main(int argc, char* argv[])
             {
                 network.RejectFile();
             }
-            else if (message.rfind("/file ", 0) == 0)
+            else if (message.rfind("/file ", 0) == 0 || message.rfind("/resume ", 0) == 0 ||
+                message.rfind("/status ", 0) == 0)
             {
                 // 이미 파일 전송 중이면 거부
                 if (sendingFile.load())
                 {
-                    std::cout << "File transfer in progress\n";
+                    std::osyncstream(std::cout) << "File transfer in progress\n";
                     continue;
                 }
 
@@ -175,7 +214,17 @@ int main(int argc, char* argv[])
                 if (fileSender.joinable())
                     fileSender.join();
 
-                std::string path = message.substr(6);
+                uint8_t mode = message.rfind("/resume ", 0) == 0 ? 1 :
+                    message.rfind("/status ", 0) == 0 ? 2 : 0;
+                std::string transferId;
+                std::string path = message.substr(mode ? 8 : 6);
+                if (mode) {
+                    const auto separator = path.find(' ');
+                    if (separator != 64 || separator + 1 == path.size()) {
+                        std::osyncstream(std::cout) << "Usage: /resume|/status <transferId> <path>\n"; continue;
+                    }
+                    transferId = path.substr(0, separator); path.erase(0, separator + 1);
+                }
 
                 if (path.size() >= 2 &&
                     path.front() == '"' &&
@@ -187,11 +236,11 @@ int main(int argc, char* argv[])
                 sendingFile.store(true);
 
                 fileSender = std::thread(
-                    [&network, &sendingFile, path]()
+                    [&network, &sendingFile, path, transferId, mode]()
                     {
                         try
                         {
-                            bool success = network.SendFile(path);
+                            bool success = network.SendFile(path, transferId, mode);
 
                             if (!success)
                                 std::cerr << "\nFile transfer not completed\n";
@@ -210,7 +259,7 @@ int main(int argc, char* argv[])
                         sendingFile.store(false);
                     });
 
-                std::cout << "File send task started\n";
+                std::osyncstream(std::cout) << "File send task started\n";
             }
             else
             {

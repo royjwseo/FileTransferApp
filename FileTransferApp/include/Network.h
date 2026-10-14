@@ -34,10 +34,15 @@ public:
     // Call after workers have been joined. Also serializes with in-flight I/O.
     void Disconnect();
 
-    bool SendFile(const std::string& path);
+    bool SendFile(const std::string& path, const std::string& transferId = {}, uint8_t mode = 0);
 public:
     bool AcceptFile();
     bool RejectFile();
+    bool CancelFile(uint64_t requestId = 0);
+    bool Reconnect();
+    bool IsConnected();
+    void EnableAutoReconnect(bool enabled) { autoReconnect_ = enabled; }
+    bool AutoReconnectEnabled() const { return autoReconnect_; }
 
     void CancelPendingApproval();
 private:
@@ -54,6 +59,15 @@ private:
     bool AdoptSocket(SOCKET socket, bool host);
     SOCKET ConnectedSocket(); // Caller holds sendMutex_ or receiveMutex_.
     bool initialized_ = false;
+    void ReceiveSession();
+    void StopConnection();
+    bool WaitForSocket(SOCKET socket, bool writable, std::chrono::seconds timeout);
+    std::atomic<bool> userStopping_{ false }, autoReconnect_{ false };
+    bool reconnectAttempt_ = false, endpointHost_ = false;
+    uint16_t endpointPort_ = 0;
+    std::string endpointIp_;
+    std::mutex retryMutex_;
+    std::condition_variable retryCv_;
 
     Protocol protocol_;
 

@@ -20,6 +20,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\FileTransfer.h" />
+    <ClInclude Include="include\TransferStorage.h" />
     <ClInclude Include="include\Network.h" />
     <ClInclude Include="include\Protocol.h" />
   </ItemGroup>

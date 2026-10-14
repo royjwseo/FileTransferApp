@@ -14,7 +14,7 @@ public:
         bool sending = false;
     };
     static constexpr size_t CHUNK_SIZE = 64 * 1024;
-    void Start(std::string name, uint64_t id, uint64_t total, bool sending);
+    void Start(std::string name, uint64_t id, uint64_t total, bool sending, uint64_t initial = 0);
     std::optional<Progress> Update(uint64_t completed, bool force = false);
     static void Print(const Progress& progress);
 private:

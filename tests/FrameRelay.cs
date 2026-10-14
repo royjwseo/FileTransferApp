@@ -20,6 +20,8 @@ public sealed class FrameRelay : IDisposable {
     volatile bool stopped;
     public volatile bool DropAck, HoldAck, PauseChunks;
     public volatile int ChunkDelayMs, FragmentSize;
+    public long PauseAfterBytes;
+    public volatile bool CorruptChunk;
     byte[] lastAck;
     TcpClient ackTarget;
     object ackWrite;
@@ -62,6 +64,7 @@ public sealed class FrameRelay : IDisposable {
     void Pump(TcpClient source, TcpClient target, object writeLock) {
         try {
             Stream input = source.GetStream();
+            long forwarded = 0;
             while (!stopped) {
                 byte[] header = Exact(input, 5);
                 int length = (header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
@@ -69,7 +72,7 @@ public sealed class FrameRelay : IDisposable {
                 byte[] payload = Exact(input, length);
                 byte[] frame = new byte[length + 5];
                 Array.Copy(header, frame, 5); Array.Copy(payload, 0, frame, 5, length);
-                if (header[0] == 3 && PauseChunks) {
+                if (header[0] == 3 && PauseChunks && forwarded >= PauseAfterBytes) {
                     chunkSeen.Set(); chunkGate.Wait();
                 }
                 if (header[0] == 5) {
@@ -79,12 +82,16 @@ public sealed class FrameRelay : IDisposable {
                     if (HoldAck) ackGate.Wait();
                 }
                 if (stopped) return;
+                if (header[0] == 3 && CorruptChunk && frame.Length > 13) {
+                    frame[13] ^= 1; CorruptChunk = false;
+                }
                 if (header[0] == 3 && ChunkDelayMs > 0) Thread.Sleep(ChunkDelayMs);
                 lock(writeLock) {
                     int fragment = FragmentSize > 0 ? FragmentSize : frame.Length;
                     for (int offset = 0; offset < frame.Length; offset += fragment)
                         target.GetStream().Write(frame, offset, Math.Min(fragment, frame.Length - offset));
                 }
+                if (header[0] == 3) forwarded += length - 8;
             }
         } catch (IOException) { Cut(); }
           catch (SocketException) { Cut(); }

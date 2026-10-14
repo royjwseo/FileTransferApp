@@ -75,7 +75,7 @@ function Start-Transfer($sender,$receiver,[string]$path,[switch]$SkipHash) {
     $name = [IO.Path]::GetFileName($path)
     if (!$SkipHash) { Record-SourceHash $path }
     $sender.Send('/file "' + $path + '"')
-    $receiver.WaitText('[Incoming file request] ' + $name)
+    $receiver.WaitText('[Incoming file request] ' + $name,60000)
     $receiver.Send('/accept')
 }
 function Saved-Path($app,[string]$name) {
@@ -130,7 +130,7 @@ foreach ($arguments in @('--help','--version')) {
     $app = New-App ([Guid]::NewGuid().ToString('N')) $arguments
     try {
         $app.WaitExit()
-        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=4 requestId64-parity')) 'Missing protocol version' }
+        if ($arguments -eq '--version') { Assert ($app.Output.Contains('protocol=5 requestId64-parity')) 'Missing protocol version' }
         else { Assert ($app.Output.Contains('--host')) 'Missing usage' }
     } finally { $app.Dispose() }
 }
@@ -231,10 +231,11 @@ foreach ($mode in @('cut-connection','kill-sender','quit-sender')) {
             }
         }
         $pair.HostApp.WaitText('Peer disconnected.',5000)
-        Wait-FileState $part $false
+        Wait-FileState $part $true
+        Assert (Test-Path ($part + '.fta')) 'Missing authenticated resume checkpoint'
         Assert (!(Test-Path -LiteralPath (Saved-Path $pair.HostApp 'large-100MiB.bin'))) 'Interrupted transfer committed'
         $pair.HostApp.Send('/quit'); $pair.HostApp.WaitExit()
-        Pass "interrupted actual upload cleans receiver-owned part: $mode"
+        Pass "interrupted actual upload retains owned resume checkpoint: $mode"
     } finally { Save-Pair $pair }
     # Restart both executables after the failed session, retaining the receiver
     # directory, then transfer and hash a new file on a new connection.

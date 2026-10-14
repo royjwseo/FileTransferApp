@@ -49,12 +49,20 @@ foreach ($mode in @('early-ack','duplicate-accept','accept-and-ack','reject-afte
             'duplicate-accept' {
                 # One TCP write makes both transitions observable before worker wakes.
                 [byte[]]$wire = @()
-                foreach ($type in @(7,7)) { $wire += [byte[]]@($type,0,0,0,8) + (U64-Bytes $id) }
+                foreach ($type in @(7,7)) {
+                    $body = [byte[]]((U64-Bytes $id) + (U64-Bytes 0) + [Text.Encoding]::ASCII.GetBytes((SHA256-Bytes @())))
+                    $wire += [byte[]]@($type,0,0,0,$body.Length) + $body
+                }
                 $c.Peer.GetStream().Write($wire,0,$wire.Length)
             }
             'accept-and-ack' {
                 [byte[]]$wire = @()
-                foreach ($type in @(7,5)) { $wire += [byte[]]@($type,0,0,0,8) + (U64-Bytes $id) }
+                foreach ($type in @(7,5)) {
+                    $content = if($type -eq 7) { [byte[]]((U64-Bytes 0) + [Text.Encoding]::ASCII.GetBytes((SHA256-Bytes @()))) }
+                        else { [Text.Encoding]::ASCII.GetBytes($script:outgoingProofs[$c.Peer.GetHashCode()]) }
+                    $body = [byte[]]((U64-Bytes $id) + $content)
+                    $wire += [byte[]]@($type,0,0,0,$body.Length) + $body
+                }
                 $c.Peer.GetStream().Write($wire,0,$wire.Length)
             }
             'reject-after-end' { Send-ToEnd $c $id; Write-Frame $c.Peer 8 @() -RequestId $id }
