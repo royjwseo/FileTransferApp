@@ -1,4 +1,5 @@
 ﻿#include "FileTransfer.h"
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
@@ -84,10 +85,11 @@ namespace {
         return s.size() == 64 && std::all_of(s.begin(), s.end(),
             [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
     }
-    std::string FileIdentity(void* file) {
+    std::string FileIdentity(void* file, bool directory = false) {
         BY_HANDLE_FILE_INFORMATION info{};
-        Require(GetFileInformationByHandle(file, &info) && info.nNumberOfLinks == 1 &&
-            !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)),
+        Require(GetFileInformationByHandle(file, &info) && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+            (directory ? (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 :
+                info.nNumberOfLinks == 1 && !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)),
             "Unsafe data object");
         std::string id;
         Append64(id, info.dwVolumeSerialNumber);
@@ -187,11 +189,11 @@ std::unique_ptr<Sha256> HashPrefix(void* file, uint64_t count, const std::functi
     }
     return hash;
 }
-TransferStorage::TransferStorage(TransferSpec spec) : spec_(std::move(spec)) {}
+TransferStorage::TransferStorage(TransferSpec spec, std::filesystem::path folder) : spec_(std::move(spec)), folder_(std::move(folder)) {}
 TransferStorage::~TransferStorage() { try { Abort(false); } catch (...) {} }
 void TransferStorage::PinDirectory(bool create) {
-    const auto folder = std::filesystem::absolute("received");
-    if (create) std::filesystem::create_directories(folder);
+    const auto folder = folder_.empty() ? std::filesystem::absolute("received") : folder_;
+    if (create && folder_.empty()) std::filesystem::create_directories(folder);
     directory_ = OwnedHandle(CreateFileW(folder.c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -204,8 +206,8 @@ void TransferStorage::PinDirectory(bool create) {
     final_ = folder / FileName::ToWide(spec_.name); part_ = final_; part_ += ".part";
     manifestPath_ = part_; manifestPath_ += ".fta";
 }
-std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spec) {
-    auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec));
+std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spec, const std::filesystem::path& folder) {
+    auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec, folder));
     try {
         store->PinDirectory(true);
         Require(!std::filesystem::exists(std::filesystem::symlink_status(store->final_)), "Destination already exists");
@@ -220,7 +222,8 @@ std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spe
             0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
         Require(bool(store->data_), "Cannot create temporary file or temporary file exists");
         store->ownsData_ = true;
-        const auto plain = spec.transferId + FileIdentity(store->data_.value);
+        const auto plain = spec.transferId + FileIdentity(store->data_.value) +
+            (folder.empty() ? std::string{} : FileIdentity(store->directory_.value, true));
         DATA_BLOB input{ static_cast<DWORD>(plain.size()), reinterpret_cast<BYTE*>(const_cast<char*>(plain.data())) }, output{};
         Require(CryptProtectData(&input, L"FileTransferApp ownership", nullptr, nullptr, nullptr,
             CRYPTPROTECT_UI_FORBIDDEN, &output), "Cannot seal resume metadata");
@@ -238,8 +241,8 @@ std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spe
     } catch (...) { store->Abort(true); throw; }
 }
 std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& spec,
-    const std::function<bool()>& cancelled) {
-    auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec));
+    const std::function<bool()>& cancelled, const std::filesystem::path& folder) {
+    auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec, folder));
     store->PinDirectory(false);
     store->manifest_ = OwnedHandle(CreateFileW(store->manifestPath_.c_str(), GENERIC_READ | DELETE,
         0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
@@ -254,14 +257,15 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     Require(CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output),
         "Resume metadata authentication failed");
     const std::string plain(reinterpret_cast<char*>(output.pbData), output.cbData); LocalFree(output.pbData);
-    Require(plain.size() == 80 && plain.substr(0, 64) == spec.transferId, "Resume transfer identity mismatch");
+    Require((plain.size() == 80 || plain.size() == 96) && plain.substr(0, 64) == spec.transferId, "Resume transfer identity mismatch");
+    if (plain.size() == 96) Require(plain.substr(80) == FileIdentity(store->directory_.value, true), "Resume directory ownership mismatch");
     store->complete_ = std::filesystem::exists(std::filesystem::symlink_status(store->final_));
     Require(spec.mode != 2 || store->complete_, "Transfer completion unknown");
     const auto path = store->complete_ ? store->final_ : store->part_;
     store->data_ = OwnedHandle(CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr,
         OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
     Require(bool(store->data_), "Cannot open owned transfer object");
-    Require(FileIdentity(store->data_.value) == plain.substr(64), "Resume file ownership mismatch");
+    Require(FileIdentity(store->data_.value) == plain.substr(64,16), "Resume file ownership mismatch");
     store->ownsData_ = true;
     Require(GetFileSizeEx(store->data_.value, &length) && length.QuadPart >= 0 &&
         uint64_t(length.QuadPart) <= spec.size, "Invalid resume offset");
@@ -270,6 +274,16 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     if (store->complete_) Require(store->offset_ == spec.size && store->hash_->Hex() == spec.digest,
         "Committed file integrity mismatch");
     return store;
+}
+void TransferStorage::ValidateDirectory(const std::filesystem::path& folder) {
+    Require(folder.is_absolute(), "Download folder must be absolute");
+    TransferStorage probe(TransferSpec{0,"probe.bin"}, folder);
+    probe.PinDirectory(false);
+    static std::atomic<uint64_t> serial{0};
+    auto path = folder / (L".fta-write-probe-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(++serial));
+    OwnedHandle file(CreateFileW(path.c_str(), GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr));
+    Require(bool(file), "Download folder is not writable");
 }
 void TransferStorage::Write(std::string_view bytes) {
     Require(!complete_ && data_ && offset_ <= spec_.size && bytes.size() <= spec_.size - offset_,

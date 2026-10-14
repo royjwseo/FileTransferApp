@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -19,13 +19,20 @@ public sealed class GuiDriver : IDisposable {
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr hwnd,uint msg,IntPtr w,StringBuilder l,uint flags,uint timeout,out IntPtr result);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern IntPtr SendMessageTimeout(IntPtr hwnd,uint msg,IntPtr w,string l,uint flags,uint timeout,out IntPtr result);
     static string Class(IntPtr h){var b=new StringBuilder(128);GetClassName(h,b,b.Capacity);return b.ToString();}
-    public GuiDriver(string exe,string cwd){
+    public GuiDriver(string exe,string cwd):this(exe,cwd,true) {}
+    public GuiDriver(string exe,string cwd,bool seedSettings){
         Process=new Process {StartInfo=new ProcessStartInfo(exe){WorkingDirectory=cwd,UseShellExecute=false,WindowStyle=ProcessWindowStyle.Hidden}};
+        string settings=System.IO.Path.Combine(cwd,"gui-settings.txt");
+        Process.StartInfo.EnvironmentVariables["FILETRANSFER_GUI_SETTINGS"]=settings;
+        if(seedSettings&&!System.IO.File.Exists(settings)){
+            string received=System.IO.Path.Combine(cwd,"received");System.IO.Directory.CreateDirectory(received);
+            System.IO.File.WriteAllText(settings,received,new UTF8Encoding(false));
+        }
         Process.Start();
         var watch=Stopwatch.StartNew();
         while(watch.ElapsedMilliseconds<5000){
             EnumWindows((h,d)=>{uint id;GetWindowThreadProcessId(h,out id);if(id==Process.Id&&Class(h)=="FileTransferAppGui")Window=h;return true;},IntPtr.Zero);
-            if(Window!=IntPtr.Zero)return;
+            if(Window!=IntPtr.Zero&&GetDlgItem(Window,128)!=IntPtr.Zero){Responsive();return;}
             if(Process.HasExited)throw new Exception("GUI exited before window creation");Thread.Sleep(20);
         }
         Dispose();throw new Exception("GUI window creation timed out");
@@ -54,6 +61,23 @@ public sealed class GuiDriver : IDisposable {
         Thread.Sleep(300);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);
         try { Wait(112,System.IO.Path.GetFileName(path)); }
         catch(Exception e){IntPtr r;var b=new StringBuilder(2048);SendMessageTimeout(edit,0xd,new IntPtr(b.Capacity),b,2,500,out r);throw new Exception(e.Message+" selected="+Text(112)+" edit="+b+" controls="+description);}
+    }
+    [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd,IntPtr after,int x,int y,int w,int h,uint flags);
+    [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath(ref Guid id,uint flags,IntPtr token,out IntPtr path);
+    public static string Downloads(){Guid id=new Guid("374DE290-123F-4565-9164-39C4925E467B");IntPtr path;int hr=SHGetKnownFolderPath(ref id,0,IntPtr.Zero,out path);if(hr!=0)Marshal.ThrowExceptionForHR(hr);try{return Marshal.PtrToStringUni(path);}finally{Marshal.FreeCoTaskMem(path);}}
+    public bool Enabled(int id){return IsWindowEnabled(GetDlgItem(Window,id));}
+    public void Resize(int width,int height){SetWindowPos(Window,IntPtr.Zero,0,0,width,height,6);Thread.Sleep(100);Responsive();}
+    public void Folder(string path,bool cancel=false){
+        Click(128);IntPtr dialog=IntPtr.Zero;var watch=Stopwatch.StartNew();
+        while(watch.ElapsedMilliseconds<5000){EnumWindows((h,d)=>{uint id;GetWindowThreadProcessId(h,out id);if(id==Process.Id&&Class(h)=="#32770")dialog=h;return true;},IntPtr.Zero);if(dialog!=IntPtr.Zero)break;Thread.Sleep(20);}
+        if(dialog==IntPtr.Zero)throw new Exception("Folder dialog missing");
+        if(cancel){PostMessage(dialog,0x111,new IntPtr(2),IntPtr.Zero);Thread.Sleep(200);return;}
+        Thread.Sleep(300);IntPtr edit=IntPtr.Zero;var desc=new StringBuilder();
+        EnumChildWindows(dialog,(h,d)=>{desc.Append(Class(h)+":"+GetDlgCtrlID(h)+" parent="+GetDlgCtrlID(GetParent(h))+"; ");if(Class(h)=="Edit"&&(GetDlgCtrlID(h)==1148||GetDlgCtrlID(GetParent(h))==1148||GetDlgCtrlID(h)==1152||GetDlgCtrlID(GetParent(h))==1152))edit=h;return true;},IntPtr.Zero);
+        if(edit==IntPtr.Zero)throw new Exception("Folder edit missing: "+desc);
+        SetHandle(edit,path);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);Thread.Sleep(300);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);
+        Wait(127,path);
     }
     public void Close(){PostMessage(Window,0x10,IntPtr.Zero,IntPtr.Zero);if(!Process.WaitForExit(7000))throw new Exception("GUI shutdown timed out");if(Process.ExitCode!=0)throw new Exception("GUI exit failure");}
     public void Dispose(){if(!Process.HasExited){Process.Kill();Process.WaitForExit();}Process.Dispose();}

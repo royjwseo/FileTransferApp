@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "FileTransfer.h"
 #include <algorithm>
 #include <deque>
@@ -7,7 +7,7 @@
 #include <vector>
 
 struct AppEvent {
-    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Log };
+    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Download, Log };
     Kind kind = Kind::Log;
     std::string text, name, transferId;
     uint64_t requestId = 0, total = 0;

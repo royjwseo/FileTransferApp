@@ -541,7 +541,7 @@ bool Network::SendReplies(std::vector<Protocol::Reply> replies)
     return true;
 }
 
-bool Network::AcceptFile(uint64_t expectedRequestId)
+bool Network::AcceptFile(uint64_t expectedRequestId, const std::filesystem::path& folder)
 {
     Protocol::IncomingFileRequest request;
     {
@@ -557,20 +557,30 @@ bool Network::AcceptFile(uint64_t expectedRequestId)
             Protocol::IncomingFileRequest current;
             return approvalCancelled_ || !protocol_.TakeFileRequest(current) ||
                 current.requestId != request.requestId || current.generation != request.generation;
-        }); }
+        }, folder); }
         catch (const std::exception& e) { error = e.what(); }
     }
     uint64_t id;
     std::vector<Protocol::Reply> replies;
+    if (!request.spec.mode && !folder.empty()) {
+        try { prepared = TransferStorage::Create(request.spec, folder); }
+        catch (const std::exception& e) { error = e.what(); }
+    }
     // A response validated on the old session must never be published on its
     // replacement socket. Do not hold this lock during the recovery hash scan.
     std::lock_guard<std::mutex> controlLock(controlMutex_);
     {
         std::lock_guard<std::mutex> lock(protocolMutex_);
-        id = protocol_.ApproveFileRequest(request, std::move(prepared), error);
+        Protocol::IncomingFileRequest current;
+        const bool valid = protocol_.TakeFileRequest(current) && current.requestId == request.requestId && current.generation == request.generation;
+        id = valid ? protocol_.ApproveFileRequest(request, std::move(prepared), error) : 0;
         if (id) replies = protocol_.TakeReplies();
     }
-    if (!id) return false;
+    if (!id) {
+        // Fresh storage prepared for an expired approval must not become an orphan.
+        if (prepared && !request.spec.mode) prepared->Abort(true);
+        return false;
+    }
     return SendReplies(std::move(replies));
 }
 bool Network::RejectFile(uint64_t expectedRequestId)

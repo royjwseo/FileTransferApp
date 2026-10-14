@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -51,10 +51,11 @@ void SeekFile(void* file, uint64_t offset);
 // Destruction preserves resumable state. Only Abort(true) deletes owned data.
 class TransferStorage {
 public:
-    static std::unique_ptr<TransferStorage> Create(const TransferSpec& spec);
+    static std::unique_ptr<TransferStorage> Create(const TransferSpec& spec, const std::filesystem::path& folder = {});
     static std::unique_ptr<TransferStorage> Recover(const TransferSpec& spec,
-        const std::function<bool()>& cancelled);
+        const std::function<bool()>& cancelled, const std::filesystem::path& folder = {});
     ~TransferStorage();
+    static void ValidateDirectory(const std::filesystem::path& folder);
     void Write(std::string_view bytes);
     void Commit();
     void Abort(bool remove);
@@ -62,10 +63,10 @@ public:
     std::string PrefixDigest() const { return hash_->Hex(); }
     bool Complete() const { return complete_; }
 private:
-    explicit TransferStorage(TransferSpec spec);
+    explicit TransferStorage(TransferSpec spec, std::filesystem::path folder = {});
     TransferSpec spec_;
     OwnedHandle directory_, data_, manifest_;
-    std::filesystem::path final_, part_, manifestPath_;
+    std::filesystem::path folder_, final_, part_, manifestPath_;
     std::unique_ptr<Sha256> hash_;
     uint64_t offset_ = 0;
     bool complete_ = false, ownsData_ = false;

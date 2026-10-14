@@ -42,7 +42,7 @@ public:
     uint64_t OutgoingRequestId();
     Protocol::SendState OutgoingState();
 public:
-    bool AcceptFile(uint64_t expectedRequestId = 0);
+    bool AcceptFile(uint64_t expectedRequestId = 0, const std::filesystem::path& folder = {});
     bool RejectFile(uint64_t expectedRequestId = 0);
     bool CancelFile(uint64_t requestId = 0);
     bool Reconnect();

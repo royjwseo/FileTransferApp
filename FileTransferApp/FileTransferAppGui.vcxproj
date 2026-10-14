@@ -22,6 +22,7 @@
     <ClInclude Include="include\FileTransfer.h" />
     <ClInclude Include="include\Events.h" />
     <ClInclude Include="include\Gui.h" />
+    <ClInclude Include="include\GuiSettings.h" />
     <ClInclude Include="include\FileName.h" />
     <ClInclude Include="include\TransferStorage.h" />
     <ClInclude Include="include\Network.h" />

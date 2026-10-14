@@ -1,6 +1,7 @@
 ﻿#define NOMINMAX
 #include "Network.h"
 #include "Gui.h"
+#include "GuiSettings.h"
 #include "FileName.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -19,7 +20,7 @@ namespace {
 enum Id { Ip=101, Port, Host, Connect, Disconnect, Reconnect, Status, Transcript,
     Message, SendText, Pick, Selected, SendFile, DropSelect, Request, Accept, Reject,
     CancelSend, CancelReceive, SendProgress, ReceiveProgress, SendDetails, ReceiveDetails,
-    TransferId, Resume, Query };
+    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup };
 struct Command {
     int type = 0; std::string text, path, transferId;
     uint64_t id = 0, session = 0; uint16_t port = 9000;
@@ -46,6 +47,7 @@ private:
     std::thread receiver_, sender_, action_;
     uint64_t session_ = 0;
     Command endpoint_;
+    std::filesystem::path downloadFolder_;
     std::thread worker_; // Start only after every field used by Loop is initialized.
     void Emit(AppEvent::Kind kind, std::string text, bool sending = false) {
         AppEvent e; e.kind = kind; e.text = std::move(text); e.session = session_; e.sending = sending; events_->Push(std::move(e));
@@ -80,7 +82,7 @@ private:
         acting_ = true;
         action_ = std::thread([this,c=std::move(c)] {
             try {
-                bool ok = c.type == Accept ? network_->AcceptFile(c.id) :
+                bool ok = c.type == Accept ? network_->AcceptFile(c.id, std::filesystem::path(FileName::ToWide(c.path))) :
                     c.type == Reject ? network_->RejectFile(c.id) : network_->SendText(c.text);
                 if (c.type == SendText && ok) Emit(AppEvent::Kind::Log, "Sent: " + c.text);
                 if (!ok) Emit(AppEvent::Kind::Log,"Operation failed or request is no longer active.");
@@ -105,7 +107,18 @@ private:
             sending_ = false;
         });
     }
+    void DownloadEvent() {
+        AppEvent e;e.kind=AppEvent::Kind::Download;e.text=FileName::ToUtf8(downloadFolder_.wstring());events_->Push(std::move(e));
+    }
     void Process(Command c) {
+        if(c.type==ChangeFolder) {
+            try {
+                auto folder=std::filesystem::path(FileName::ToWide(c.path));
+                TransferStorage::ValidateDirectory(folder);GuiSettings::Save(folder);
+                downloadFolder_=std::move(folder);DownloadEvent();
+            }catch(const std::exception& e){Emit(AppEvent::Kind::Log,std::string("Download folder error: ")+e.what());}
+            return;
+        }
         if (c.type == Host || c.type == Connect) { Begin(c); return; }
         if (c.type == Reconnect) { if(endpoint_.type!=Host&&endpoint_.type!=Connect){Emit(AppEvent::Kind::Log,"No previous endpoint.");return;} Emit(AppEvent::Kind::Log,"Reconnecting to previous endpoint"); Begin(endpoint_); return; }
         if (c.type == Disconnect) { EndSession(); Emit(AppEvent::Kind::Connection,"Disconnected"); return; }
@@ -126,10 +139,13 @@ private:
             if(c.type==CancelSend){preparationCancelled_=true;c.id=network_->OutgoingRequestId();}
             if (!c.id || !network_->CancelFile(c.id)) Emit(AppEvent::Kind::Log,"No matching active transfer to cancel.");
         } else if (c.type == SendFile || c.type == Resume || c.type == Query) File(std::move(c));
-        else Action(std::move(c));
+        else { if(c.type==Accept){ if(downloadFolder_.empty()){Emit(AppEvent::Kind::Log,"Choose a valid download folder first.");return;} c.path=FileName::ToUtf8(downloadFolder_.wstring()); } Action(std::move(c)); }
     }
     void Loop() {
         try {
+            try {
+                downloadFolder_=GuiSettings::Load();TransferStorage::ValidateDirectory(downloadFolder_);DownloadEvent();
+            }catch(const std::exception& e){downloadFolder_.clear();DownloadEvent();Emit(AppEvent::Kind::Log,std::string("Download folder error: ")+e.what());}
             while (!stop_) {
                 Command c; bool found=false;
                 {
@@ -158,7 +174,8 @@ struct Window {
     std::unique_ptr<Controller> controller;
     uint64_t session=0, incoming=0, outgoing=0;
     uint64_t selection=0, sendTerminal=0, receiveTerminal=0;
-    bool closing=false, selectedValid=false;
+    bool closing=false, selectedValid=false, connected=false, connecting=false, sendBusy=false, pendingApproval=false;
+    UINT dpi=96; HFONT font=nullptr; int scrollY=0; bool downloadReady=false;
     std::wstring path;
     std::wstring sendMetrics, receiveMetrics, sendState, receiveState;
     HWND Get(int id) { return GetDlgItem(hwnd,id); }
@@ -172,7 +189,7 @@ struct Window {
     void Control(int id,const wchar_t* type,const wchar_t* text,int x,int y,int w,int h,DWORD extra=0) {
         HWND control=CreateWindowExW(type==std::wstring_view(L"EDIT")?WS_EX_CLIENTEDGE:0,type,text,
             WS_CHILD|WS_VISIBLE|WS_TABSTOP|extra,x,y,w,h,hwnd,reinterpret_cast<HMENU>(INT_PTR(id)),instance,nullptr);
-        SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)),TRUE);
+        SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)),TRUE);
     }
     static LRESULT CALLBACK EditProc(HWND edit,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
         if(msg==WM_GETDLGCODE && l && reinterpret_cast<MSG*>(l)->wParam==VK_RETURN)
@@ -180,7 +197,41 @@ struct Window {
         if(msg==WM_KEYDOWN && w==VK_RETURN){SendMessageW(GetParent(edit),WM_COMMAND,SendText,0);return 0;}
         return DefSubclassProc(edit,msg,w,l);
     }
+    ~Window(){controller.reset();if(font)DeleteObject(font);}
+    int Scale(int n) const {return MulDiv(n,dpi,96);}
+    void Layout() {
+        if(!Get(Ip))return;
+        RECT r{};GetClientRect(hwnd,&r);int w=MulDiv(r.right,96,dpi),h=MulDiv(r.bottom,96,dpi);
+        const int extra=std::max(0,h-795),width=w-40;
+        SCROLLINFO si{sizeof(si),SIF_RANGE|SIF_PAGE|SIF_POS};si.nMax=Scale(795)-1;si.nPage=r.bottom;si.nPos=scrollY;SetScrollInfo(hwnd,SB_VERT,&si,TRUE);si.fMask=SIF_POS;GetScrollInfo(hwnd,SB_VERT,&si);scrollY=si.nPos;
+        auto move=[&](int id,int x,int y,int cw,int ch){MoveWindow(Get(id),Scale(x),Scale(y)-scrollY,Scale(cw),Scale(ch),TRUE);};
+        move(ConnectionGroup,10,5,w-20,93);move(Ip,25,29,170,27);move(Port,205,29,65,27);
+        move(Host,280,29,100,29);move(Connect,390,29,75,29);move(Disconnect,475,29,100,29);move(Reconnect,585,29,90,29);move(Status,25,65,width,24);
+        move(MessageGroup,10,105,w-20,225+extra);move(Transcript,25,128,width,155+extra);move(Message,25,291+extra,w-175,28);move(SendText,w-140,291+extra,115,28);
+        int f=340+extra;move(FileGroup,10,f,w-20,188);move(Pick,25,f+25,105,29);move(SendFile,140,f+25,115,29);
+        move(Selected,25,f+61,width,35);move(Request,25,f+101,w-245,36);move(Accept,w-210,f+100,85,29);move(Reject,w-115,f+100,85,29);
+        move(DownloadPath,25,f+145,w-175,35);move(ChangeFolder,w-140,f+143,115,29);
+        int p=538+extra;move(ProgressGroup,10,p,w-20,247);move(CancelSend,25,p+25,105,29);move(CancelReceive,140,p+25,105,29);
+        move(SendProgress,25,p+64,width,18);move(SendDetails,25,p+86,width,43);move(ReceiveProgress,25,p+132,width,18);move(ReceiveDetails,25,p+154,width,43);
+        move(TransferId,25,p+205,w-270,28);move(Resume,w-235,p+205,100,29);move(Query,w-125,p+205,100,29);
+    }
+    void Font() {
+        HFONT next=CreateFontW(-Scale(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+        for(HWND child=GetWindow(hwnd,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(next),TRUE);
+        if(font)DeleteObject(font);font=next;
+    }
+    void Buttons() {
+        auto enable=[&](int id,bool on){EnableWindow(Get(id),on&&!closing);};
+        enable(Host,!connected&&!connecting);enable(Connect,!connected&&!connecting);enable(Disconnect,connected||connecting);enable(Reconnect,!connected&&!connecting);
+        enable(SendText,connected);enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
+        enable(Accept,connected&&pendingApproval&&downloadReady);enable(Reject,connected&&pendingApproval);enable(CancelReceive,connected&&incoming!=0);enable(CancelSend,connected&&sendBusy);
+    }
     void Create() {
+        dpi=GetDpiForWindow(hwnd);
+        Control(ConnectionGroup,L"BUTTON",L"연결 · IPv4 / 포트",0,0,0,0,BS_GROUPBOX);
+        Control(MessageGroup,L"BUTTON",L"메시지",0,0,0,0,BS_GROUPBOX);
+        Control(FileGroup,L"BUTTON",L"파일 전송 · 한 번에 파일 하나",0,0,0,0,BS_GROUPBOX);
+        Control(ProgressGroup,L"BUTTON",L"진행 상태 · 저장 ACK 확인 후 송신 성공",0,0,0,0,BS_GROUPBOX);
         Control(Ip,L"EDIT",L"127.0.0.1",15,15,170,25);
         Control(Port,L"EDIT",L"9000",195,15,65,25,ES_NUMBER);
         SendMessageW(Get(Port),EM_SETLIMITTEXT,5,0);SendMessageW(Get(Ip),EM_SETLIMITTEXT,15,0);
@@ -201,6 +252,9 @@ struct Window {
         Control(TransferId,L"EDIT",L"",15,660,565,25,ES_AUTOHSCROLL); SendMessageW(Get(TransferId),EM_SETLIMITTEXT,64,0);
         Control(Resume,L"BUTTON",L"이어받기",590,660,100,28);Control(Query,L"BUTTON",L"완료 조회",700,660,110,28);
         for(int id:{SendProgress,ReceiveProgress})SendMessageW(Get(id),PBM_SETRANGE32,0,1000);
+        Control(DownloadPath,L"STATIC",L"다운로드 폴더 확인 중...",0,0,0,0,SS_PATHELLIPSIS);
+        Control(ChangeFolder,L"BUTTON",L"폴더 변경",0,0,0,0);
+        Font();Layout();Buttons();
         DragAcceptFiles(hwnd,TRUE); SetTimer(hwnd,1,50,nullptr);
         controller=std::make_unique<Controller>(events);
     }
@@ -210,6 +264,15 @@ struct Window {
     }
     void CommandClick(int id) {
         if(closing)return;
+        if(id==ChangeFolder) {
+            IFileOpenDialog* dialog=nullptr;
+            if(SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))) {
+                DWORD options=0;dialog->GetOptions(&options);dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST|FOS_NOCHANGEDIR);
+                dialog->SetTitle(L"다운로드 폴더 선택");
+                if(SUCCEEDED(dialog->Show(hwnd))) {IShellItem* item=nullptr;if(SUCCEEDED(dialog->GetResult(&item))){PWSTR path=nullptr;if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&path))){Command c;c.type=ChangeFolder;c.path=FileName::ToUtf8(path);if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");CoTaskMemFree(path);}item->Release();}}
+                dialog->Release();
+            }else Log(L"폴더 선택 창을 열 수 없습니다.");return;
+        }
         if(id==Pick){
             wchar_t buffer[32768]{};OPENFILENAMEW dialog{sizeof(dialog)};dialog.hwndOwner=hwnd;dialog.lpstrFile=buffer;dialog.nMaxFile=32768;
             dialog.lpstrFilter=L"모든 파일\0*.*\0\0";dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
@@ -231,14 +294,15 @@ struct Window {
     void Tick() {
         std::wstring textBatch;
         for(auto& e:events->Drain()) {
+            if(e.kind==AppEvent::Kind::Download){downloadReady=!e.text.empty();Set(DownloadPath,downloadReady?Wide(e.text):L"저장 폴더를 선택하세요 (설정 오류)");continue;}
             if(e.kind==AppEvent::Kind::Selection){if(e.requestId!=selection)continue;path=Wide(e.text);selectedValid=true;Set(Selected,Wide(e.name)+L" — "+std::to_wstring(e.total)+L" bytes");continue;}
-            if(e.kind==AppEvent::Kind::Connection && e.session>=session){if(e.session!=session||e.text=="Disconnected"){incoming=outgoing=0;sendTerminal=receiveTerminal=0;Set(Request,L"수신 요청 없음");}session=e.session;Set(Status,Wide(e.text));Log(Wide(e.text));}
+            if(e.kind==AppEvent::Kind::Connection && e.session>=session){if(e.session!=session||e.text=="Disconnected"){incoming=outgoing=0;sendTerminal=receiveTerminal=0;Set(Request,L"수신 요청 없음");}session=e.session;connected=e.text.starts_with("Connected:");connecting=e.text=="Waiting for peer"||e.text=="Connecting";if(!connected){sendBusy=false;pendingApproval=false;}Set(Status,Wide(e.text));Log(Wide(e.text));}
             else if(e.session!=session)continue;
             else if(e.kind==AppEvent::Kind::Text){textBatch+=L"상대: "+Wide(e.text)+L"\r\n";if(textBatch.size()>32000){textBatch.erase(0,textBatch.size()-32000);if(!textBatch.empty()&&textBatch.front()>=0xdc00&&textBatch.front()<=0xdfff)textBatch.erase(0,1);}}
-            else if(e.kind==AppEvent::Kind::Request){incoming=e.requestId;receiveTerminal=0;receiveMetrics.clear();receiveState.clear();Set(Request,Wide(e.name)+L" / "+std::to_wstring(e.total)+L" bytes / requestId="+std::to_wstring(incoming));Log(L"수신 요청: "+Wide(e.name));}
+            else if(e.kind==AppEvent::Kind::Request){incoming=e.requestId;pendingApproval=true;receiveTerminal=0;receiveMetrics.clear();receiveState.clear();Set(Request,Wide(e.name)+L" / "+std::to_wstring(e.total)+L" bytes / requestId="+std::to_wstring(incoming));Log(L"수신 요청: "+Wide(e.name));}
             else if(e.kind==AppEvent::Kind::Identity){outgoing=e.requestId;sendTerminal=0;sendMetrics.clear();sendState.clear();Set(TransferId,Wide(e.transferId));Log(L"전송 ID: "+Wide(e.transferId));}
             else if(e.kind==AppEvent::Kind::Progress){
-                auto& p=e.progress;std::wostringstream text;
+                auto& p=e.progress;if(!p.sending)pendingApproval=false;std::wostringstream text;
                 text<<(p.sending?L"송신 ":L"수신 ")<<Wide(p.fileName)<<L" requestId="<<p.requestId<<L" "<<p.completed<<L"/"<<p.total<<L" bytes "<<p.percent<<L"% "<<p.mibPerSecond<<L" MiB/s "<<p.elapsedSeconds<<L"s";
                 auto& metrics=p.sending?sendMetrics:receiveMetrics;metrics=text.str();
                 if(p.requestId!=(p.sending?sendTerminal:receiveTerminal)){auto& state=p.sending?sendState:receiveState;state=p.sending?L"Sending data":L"Receiving data";}
@@ -248,13 +312,15 @@ struct Window {
             }
             else if(e.kind==AppEvent::Kind::State){
                 auto& state=e.sending?sendState:receiveState;state=Wide(e.text);
+                if(e.sending)sendBusy=!(e.text.starts_with("Completed")||e.text.starts_with("Cancelled")||e.text.starts_with("Failed"));
                 if(e.sending&&e.requestId==0&&e.text.find("Preparing")==0){sendMetrics.clear();outgoing=sendTerminal=0;}
                 Set(e.sending?SendDetails:ReceiveDetails,(e.sending?sendMetrics:receiveMetrics)+L"\r\n"+Wide(e.name)+L" "+state);Log(state);
-                if(!e.sending){receiveTerminal=e.requestId;incoming=0;Set(Request,L"수신 요청 없음");}
+                if(!e.sending){pendingApproval=false;receiveTerminal=e.requestId;incoming=0;Set(Request,L"수신 요청 없음");}
                 else if(e.text.find("Completed")==0||e.text.find("Cancelled")==0||e.text.find("Failed")==0){sendTerminal=e.requestId;outgoing=0;}
             }            else if(e.kind==AppEvent::Kind::Log)Log(Wide(e.text));
         }
         if(!textBatch.empty())Log(std::move(textBatch));
+        Buttons();
         if(closing && controller->Done()){KillTimer(hwnd,1);DestroyWindow(hwnd);}
     }
 };
@@ -265,6 +331,11 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
     try {
         switch(message){
         case WM_CREATE:window->Create();return 0;
+        case WM_SIZE:window->Layout();return 0;
+        case WM_VSCROLL:{SCROLLINFO si{sizeof(si),SIF_ALL};GetScrollInfo(hwnd,SB_VERT,&si);int pos=si.nPos;switch(LOWORD(w)){case SB_LINEUP:pos-=window->Scale(25);break;case SB_LINEDOWN:pos+=window->Scale(25);break;case SB_PAGEUP:pos-=si.nPage;break;case SB_PAGEDOWN:pos+=si.nPage;break;case SB_THUMBTRACK:pos=si.nTrackPos;break;}window->scrollY=std::max(0,pos);window->Layout();return 0;}
+        case WM_MOUSEWHEEL:window->scrollY=std::max(0,window->scrollY-MulDiv(GET_WHEEL_DELTA_WPARAM(w),window->Scale(60),WHEEL_DELTA));window->Layout();return 0;
+        case WM_GETMINMAXINFO:{auto* limits=reinterpret_cast<MINMAXINFO*>(l);limits->ptMinTrackSize={window->Scale(850),window->Scale(450)};return 0;}
+        case WM_DPICHANGED:{window->dpi=HIWORD(w);window->Font();auto* r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);window->Layout();return 0;}
         case WM_COMMAND:if(HIWORD(w)==BN_CLICKED)window->CommandClick(LOWORD(w));return 0;
         case WM_TIMER:window->Tick();return 0;
         case WM_DROPFILES:{HDROP drop=reinterpret_cast<HDROP>(w);struct DropOwner{HDROP value;~DropOwner(){DragFinish(value);}} owner{drop};if(DragQueryFileW(drop,0xffffffff,nullptr,0)==1&&!window->closing){UINT size=DragQueryFileW(drop,0,nullptr,0);if(size>32768){window->Log(L"파일 경로가 너무 깁니다.");return 0;}std::wstring path(size+1,L'\0');DragQueryFileW(drop,0,path.data(),size+1);path.resize(size);window->Select(std::move(path));}else window->Log(L"한 번에 파일 하나를 놓으세요.");return 0;}
@@ -276,13 +347,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
 }
 }
 int RunGui(HINSTANCE instance,int show) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    struct ComOwner {HRESULT hr;~ComOwner(){if(SUCCEEDED(hr))CoUninitialize();}} comOwner{com};
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_PROGRESS_CLASS};InitCommonControlsEx(&controls);
     WNDCLASSEXW klass{sizeof(klass)};klass.hInstance=instance;klass.lpfnWndProc=WndProc;klass.lpszClassName=L"FileTransferAppGui";
     klass.hCursor=LoadCursorW(nullptr,IDC_ARROW);klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_BTNFACE+1);
     if(!RegisterClassExW(&klass))return 1;
-    Window window;window.instance=instance;
-    HWND hwnd=CreateWindowExW(0,klass.lpszClassName,L"FileTransferApp — LAN 파일 전송",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
-        CW_USEDEFAULT,CW_USEDEFAULT,850,745,nullptr,nullptr,instance,&window);
+    Window window;window.instance=instance;window.dpi=GetDpiForSystem();
+    RECT desktop{};SystemParametersInfoW(SPI_GETWORKAREA,0,&desktop,0);
+    HWND hwnd=CreateWindowExW(0,klass.lpszClassName,L"FileTransferApp — LAN 파일 전송",WS_OVERLAPPEDWINDOW|WS_VSCROLL,
+        CW_USEDEFAULT,CW_USEDEFAULT,std::min(window.Scale(900),static_cast<int>(desktop.right-desktop.left)),std::min(window.Scale(850),static_cast<int>(desktop.bottom-desktop.top)),nullptr,nullptr,instance,&window);
     if(!hwnd)return 1;
     ShowWindow(hwnd,show);UpdateWindow(hwnd);
     MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(hwnd,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
