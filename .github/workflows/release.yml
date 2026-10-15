@@ -16,6 +16,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate-package:
+    # v1.1.0 is explicitly published locally without rerunning regression tests.
+    if: github.ref != 'refs/tags/v1.1.0'
     runs-on: windows-2025-vs2026
     timeout-minutes: 60
     steps:

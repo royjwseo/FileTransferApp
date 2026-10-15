@@ -1,6 +1,6 @@
 ﻿#pragma once
 #define FTA_VERSION_MAJOR 1
-#define FTA_VERSION_MINOR 0
+#define FTA_VERSION_MINOR 1
 #define FTA_VERSION_PATCH 0
 #define FTA_STRINGIFY_INNER(x) #x
 #define FTA_STRINGIFY(x) FTA_STRINGIFY_INNER(x)
