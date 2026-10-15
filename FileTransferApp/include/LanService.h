@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "Network.h"
+#include "TrustedPeers.h"
 #include <map>
 #include <optional>
 
@@ -14,6 +15,8 @@ public:
     bool Request(const std::string& ip,uint16_t port,const std::string& expectedId = {});
     void Decide(uint64_t token,bool accept);
     void Cancel();
+    void RegisterPeer(const std::string& ip,const std::string& key);
+    void ForgetPeer(const std::string& ip);
     bool Pending() const;
     struct Approved {SOCKET socket;bool host;};
     std::optional<Approved> TakeApproved();
@@ -24,6 +27,8 @@ private:
         SOCKET socket=INVALID_SOCKET;std::string input,output,peerId,expectedId,nonce,ip;
         bool outgoing=false,connecting=false,prompt=false,accepted=false;
         uint64_t token=0;Clock::time_point deadline;
+        std::string key,greeting,challenge,authentication;
+        int authStage=0;
     };
     std::shared_ptr<EventQueue> events_;
     SOCKET udp_=INVALID_SOCKET,listener_=INVALID_SOCKET;
@@ -32,6 +37,7 @@ private:
     uint16_t port_=0;
     uint64_t nextToken_=0;
     std::string id_,name_;
+    TrustedPeers::Store trusted_;
     sockaddr_in group_{};
     std::vector<in_addr> interfaces_;
     Clock::time_point nextSearch_{},nextReply_{},lastSearch_{};

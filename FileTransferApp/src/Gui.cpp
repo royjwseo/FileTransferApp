@@ -23,7 +23,7 @@ namespace {
 enum Id { Ip=101, Port, Host, Connect, Disconnect, Reconnect, Status, Transcript,
     Message, SendText, Pick, Selected, SendFile, DropSelect, Request, Accept, Reject,
     CancelSend, CancelReceive, SendProgress, ReceiveProgress, SendDetails, ReceiveDetails,
-    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus, OpenChat, ActivityLog, AutoInfo };
+    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus, OpenChat, ActivityLog, AutoInfo, RegisterPeer, ForgetPeer, RegistrationKey, TrustInfo };
 struct Command {
     int type = 0; std::string text, path, transferId;
     uint64_t id = 0, session = 0; uint16_t port = 9000;
@@ -158,6 +158,10 @@ private:
         });
     }
     void Process(Command c) {
+        if(c.type==RegisterPeer||c.type==ForgetPeer){
+            try{if(lan_){if(c.type==RegisterPeer)lan_->RegisterPeer(c.text,c.path);else lan_->ForgetPeer(c.text);}}
+            catch(const std::exception& e){Emit(AppEvent::Kind::Log,std::string("PC registration failed: ")+e.what());}return;
+        }
         if(c.type==RefreshDevices){if(lan_)lan_->Refresh();return;}
         if(c.type==ConsentAccept||c.type==ConsentReject){if(lan_)lan_->Decide(c.id,c.type==ConsentAccept);return;}
         if(c.type==RequestConnect||c.type==DirectConsent){
@@ -262,7 +266,7 @@ struct Window {
     int Scale(int n) const {return MulDiv(n,dpi,96);}
     void Layout() {
         if(!Get(Ip))return;
-        RECT r{};GetClientRect(hwnd,&r);int top=legacy?0:225;
+        RECT r{};GetClientRect(hwnd,&r);int top=legacy?0:285;
         SCROLLINFO si{sizeof(si),SIF_RANGE|SIF_PAGE|SIF_POS};si.nMax=Scale(795+top)-1;si.nPage=r.bottom;si.nPos=scrollY;SetScrollInfo(hwnd,SB_VERT,&si,TRUE);si.fMask=SIF_POS;GetScrollInfo(hwnd,SB_VERT,&si);scrollY=si.nPos;
         // SetScrollInfo can show/hide the bar and change the client width.
         GetClientRect(hwnd,&r);
@@ -284,9 +288,10 @@ struct Window {
         auto move=[&](int id,int x,int y,int cw,int ch){place(id,x,y+top,cw,ch);};
         if(!legacy){
             auto lane=[&](int id,int x,int y,int cw,int ch){place(id,x,y,cw,ch);};
-            lane(LanGroup,10,5,w-20,215);lane(Devices,25,28,w-210,83);lane(RefreshDevices,w-175,28,145,29);lane(RequestConnect,w-175,66,145,29);
+            lane(LanGroup,10,5,w-20,275);lane(Devices,25,28,w-210,83);lane(RefreshDevices,w-175,28,145,29);lane(RequestConnect,w-175,66,145,29);
             lane(LanStatus,25,115,w-50,26);lane(ConsentText,25,148,w-250,45);lane(ConsentAccept,w-215,153,90,30);lane(ConsentReject,w-115,153,90,30);
-            lane(DirectConsent,280,254,150,29);
+            lane(RegistrationKey,25,200,w-340,27);lane(RegisterPeer,w-300,200,130,29);lane(ForgetPeer,w-160,200,130,29);
+            lane(TrustInfo,25,237,w-50,32);lane(DirectConsent,280,top+29,150,29);
         }
         move(ConnectionGroup,10,5,w-20,93);move(Ip,25,29,170,27);move(Port,205,29,65,27);
         move(Host,280,29,100,29);move(Connect,390,29,75,29);move(Disconnect,475,29,100,29);move(Reconnect,585,29,90,29);move(Status,25,65,width,24);
@@ -311,6 +316,7 @@ struct Window {
         auto enable=[&](int id,bool on){EnableWindow(Get(id),on&&!closing);};
         enable(Host,legacy&&!connected&&!connecting);enable(Connect,legacy&&!connected&&!connecting);enable(Disconnect,connected||connecting||lanPending);enable(Reconnect,legacy&&!connected&&!connecting);
         enable(RequestConnect,!connected&&!lanPending&&consentToken==0);enable(DirectConsent,!connected&&!lanPending&&consentToken==0);enable(ConsentAccept,!connected&&consentToken!=0);enable(ConsentReject,consentToken!=0);
+        enable(RegisterPeer,!legacy&&!connected&&!lanPending);enable(ForgetPeer,!legacy&&!connected&&!lanPending);enable(RegistrationKey,!legacy&&!connected&&!lanPending);
         chat.SetConnected(connected&&!closing);enable(OpenChat,true);enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
         enable(Accept,connected&&pendingApproval&&downloadReady);enable(Reject,connected&&pendingApproval);enable(CancelReceive,connected&&incoming!=0);enable(CancelSend,connected&&sendBusy);
     }
@@ -324,6 +330,10 @@ struct Window {
         Control(ConsentText,L"STATIC",L"연결 요청 없음",0,0,0,0);
         Control(ConsentAccept,L"BUTTON",L"연결 승인",0,0,0,0);Control(ConsentReject,L"BUTTON",L"연결 거절",0,0,0,0);
         Control(LanStatus,L"STATIC",L"LAN 시작 중",0,0,0,0);
+        Control(RegistrationKey,L"EDIT",L"",0,0,0,0,ES_AUTOHSCROLL);SendMessageW(Get(RegistrationKey),EM_SETLIMITTEXT,64,0);
+        SendMessageW(Get(RegistrationKey),EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"등록 키 64자리 (비우면 새 키 생성)"));
+        Control(RegisterPeer,L"BUTTON",L"선택 PC 등록",0,0,0,0);Control(ForgetPeer,L"BUTTON",L"선택 PC 해제",0,0,0,0);
+        Control(TrustInfo,L"STATIC",L"양쪽에서 상대 PC를 선택하고 같은 키로 등록하면 자동 연결됩니다. 키는 안전하게 전달하세요.",0,0,0,0);
         Control(ConnectionGroup,L"BUTTON",L"연결 · IPv4 / 포트",0,0,0,0,BS_GROUPBOX);
         Control(MessageGroup,L"BUTTON",L"작업 기록 · 대화는 별도 창에서",0,0,0,0,BS_GROUPBOX);
         Control(FileGroup,L"BUTTON",L"파일 전송 · 한 번에 파일 하나",0,0,0,0,BS_GROUPBOX);
@@ -353,7 +363,7 @@ struct Window {
         Font();Layout();Buttons();
         DragAcceptFiles(hwnd,TRUE); SetTimer(hwnd,1,50,nullptr);
         controller=std::make_unique<Controller>(events,legacy);
-        for(int id:{LanGroup,Devices,RefreshDevices,RequestConnect,DirectConsent,ConsentText,ConsentAccept,ConsentReject,LanStatus})ShowWindow(Get(id),legacy?SW_HIDE:SW_SHOW);
+        for(int id:{LanGroup,Devices,RefreshDevices,RequestConnect,DirectConsent,ConsentText,ConsentAccept,ConsentReject,LanStatus,RegisterPeer,ForgetPeer,RegistrationKey,TrustInfo})ShowWindow(Get(id),legacy?SW_HIDE:SW_SHOW);
         if(!legacy){for(int id:{Host,Connect,Reconnect})ShowWindow(Get(id),SW_HIDE);}
     }
     void Select(std::wstring file) {
@@ -362,6 +372,17 @@ struct Window {
     }
     void CommandClick(int id) {
         if(closing)return;
+        if(id==RegisterPeer||id==ForgetPeer){
+            if(legacy||connected||lanPending)return;
+            int selected=static_cast<int>(SendMessageW(Get(Devices),LB_GETCURSEL,0,0));
+            if(selected<0||selected>=static_cast<int>(peers.size())){Log(L"등록/해제할 상대 PC를 목록에서 선택하세요.");return;}
+            Command c;c.type=id;c.text=peers[selected].ip;
+            if(id==RegisterPeer){
+                auto key=FileName::ToUtf8(Text(Get(RegistrationKey)));if(key.empty()){key=TrustedPeers::Generate();Set(RegistrationKey,Wide(key));}
+                if(!TrustedPeers::Hex(key)){Log(L"등록 키는 소문자 0-9, a-f로 된 64자리여야 합니다.");return;}c.path=std::move(key);
+            }
+            if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");return;
+        }
         if(id==OpenChat){chat.Open();return;}
         if((id==Accept||id==Reject)&&!legacy)return;
         if(id==SendText&&!connected)return;

@@ -24,6 +24,7 @@
     <ClInclude Include="include\Gui.h" />
     <ClInclude Include="include\ChatWindow.h" />
     <ClInclude Include="include\LanService.h" />
+    <ClInclude Include="include\TrustedPeers.h" />
     <ClInclude Include="include\GuiSettings.h" />
     <ClInclude Include="include\FileName.h" />
     <ClInclude Include="include\TransferStorage.h" />

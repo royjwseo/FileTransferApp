@@ -19,6 +19,7 @@ LanService::LanService(std::shared_ptr<EventQueue> events):events_(std::move(eve
     WSADATA w{};if(WSAStartup(MAKEWORD(2,2),&w))throw std::runtime_error("Discovery Winsock initialization failed");initialized_=true;
     try {
         id_=RandomId();wchar_t computer[256]{};DWORD n=256;GetComputerNameW(computer,&n);
+        try{trusted_.Load();}catch(const std::exception& e){Event(AppEvent::Kind::LanStatus,std::string("Registered peers unavailable; manual approval only: ")+e.what());}
         name_=FileName::ToUtf8(computer);if(!Name(name_))name_="Windows PC";
         listener_=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);BOOL exclusive=TRUE;
         if(listener_==INVALID_SOCKET||setsockopt(listener_,SOL_SOCKET,SO_EXCLUSIVEADDRUSE,reinterpret_cast<char*>(&exclusive),sizeof(exclusive)))throw std::runtime_error("Cannot create consent listener");
@@ -67,6 +68,8 @@ void LanService::Datagram(std::string_view bytes,const sockaddr_in& source){
 bool LanService::Pending()const{return inbound_.has_value()||outbound_.has_value()||approved_.has_value();}
 void LanService::Drop(std::optional<Candidate>& c,const char* reason){if(!c)return;if(c->prompt)Event(AppEvent::Kind::Consent,"",0);Close(c->socket);c.reset();if(reason)Event(AppEvent::Kind::LanStatus,reason);}
 void LanService::Cancel(){Drop(inbound_,nullptr);Drop(outbound_,nullptr);if(approved_){Close(approved_->socket);approved_.reset();}}
+void LanService::RegisterPeer(const std::string& ip,const std::string& key){Cancel();trusted_.Register(ip,key);Event(AppEvent::Kind::LanStatus,"Registered PC saved: "+ip+" (matching key required on both PCs)");}
+void LanService::ForgetPeer(const std::string& ip){Cancel();trusted_.Forget(ip);Event(AppEvent::Kind::LanStatus,"Registered PC removed: "+ip);}
 bool LanService::Request(const std::string& ip,uint16_t port,const std::string& expectedId){
     if(busy_||outbound_||approved_||!port){Event(AppEvent::Kind::LanStatus,"Connection request refused: busy");return false;}
     if(!expectedId.empty()){auto it=peers_.find(expectedId);if(it==peers_.end()||it->second.ip!=ip||it->second.port!=port||Clock::now()-it->second.seen>std::chrono::seconds(8)){Event(AppEvent::Kind::LanStatus,"Selected device is offline or changed; refresh");return false;}}
@@ -82,7 +85,9 @@ bool LanService::Request(const std::string& ip,uint16_t port,const std::string& 
     }
     sockaddr_in remote{};remote.sin_family=AF_INET;remote.sin_port=htons(port);if(inet_pton(AF_INET,ip.c_str(),&remote.sin_addr)!=1)return false;
     Candidate c;c.outgoing=true;c.ip=ip;c.expectedId=expectedId;c.nonce=RandomId();c.deadline=Clock::now()+std::chrono::seconds(15);
-    c.output="FTA-C1|"+id_+"|"+c.nonce+"|"+name_+"\n";
+    c.key=trusted_.Key(ip);
+    c.greeting=std::string(c.key.empty()?"FTA-C1|":"FTA-C2|")+id_+"|"+c.nonce+"|"+name_;
+    c.output=c.greeting+"\n";if(!c.key.empty())c.authStage=1;
     c.socket=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);if(c.socket==INVALID_SOCKET||!Nonblock(c.socket)){Close(c.socket);return false;}
     if(connect(c.socket,reinterpret_cast<sockaddr*>(&remote),sizeof(remote))){if(WSAGetLastError()!=WSAEWOULDBLOCK){Close(c.socket);Event(AppEvent::Kind::LanStatus,"Connection request failed");return false;}c.connecting=true;}
     outbound_=std::move(c);Event(AppEvent::Kind::LanStatus,"Awaiting peer connection approval");return true;
@@ -96,21 +101,45 @@ void LanService::Advance(std::optional<Candidate>& candidate){
         int sent=send(c.socket,c.output.data(),static_cast<int>(c.output.size()),0);
         if(sent>0)c.output.erase(0,sent);else if(sent==SOCKET_ERROR&&WSAGetLastError()==WSAEWOULDBLOCK)return;else{Drop(candidate,"Connection request closed");return;}
         if(!c.output.empty())return;
-        if(!c.outgoing&&!c.prompt){if(c.accepted){approved_=std::move(candidate);candidate.reset();}else Drop(candidate,"Connection rejected");return;}
+        if(!c.outgoing&&!c.prompt&&c.authStage!=1){if(c.accepted){approved_=std::move(candidate);candidate.reset();}else Drop(candidate,"Connection rejected");return;}
     }
     // Read only the gate line, leaving post-approval file protocol bytes in TCP.
     for(int i=0;i<256;++i){char ch;int n=recv(c.socket,&ch,1,0);if(n==0){Drop(candidate,"Connection request closed");return;}if(n<0){if(WSAGetLastError()==WSAEWOULDBLOCK)return;Drop(candidate,"Connection request failed");return;}
         if(c.prompt){Drop(candidate,"Commands before approval are forbidden");return;}
         if(ch!='\n'){c.input+=ch;if(c.input.size()>256){Drop(candidate,"Invalid connection greeting");return;}continue;}
         auto f=Split(c.input);c.input.clear();
+        if(c.authStage){
+            if(c.outgoing&&c.authStage==1){
+                if(f.size()!=4||f[0]!="FTA-H2"||!Hex(f[1])||!Hex(f[2])||!TrustedPeers::Hex(f[3])||(!c.expectedId.empty()&&c.expectedId!=f[1])){Drop(candidate,"Registered PC authentication failed (registration/version mismatch)");return;}
+                c.authentication=c.greeting+"|"+f[1]+"|"+f[2];
+                if(!TrustedPeers::Equal(f[3],TrustedPeers::Mac(c.key,"server|"+c.authentication))){Drop(candidate,"Registered PC authentication failed: key mismatch");return;}
+                c.output="FTA-P2|"+TrustedPeers::Mac(c.key,"client|"+c.authentication)+"\n";c.authStage=2;return;
+            }
+            if(c.outgoing&&c.authStage==2){
+                if(f.size()!=4||f[0]!="FTA-A2"||!Hex(f[1])||f[2]!=c.nonce||!TrustedPeers::Equal(f[3],TrustedPeers::Mac(c.key,"accepted|"+c.authentication))){Drop(candidate,"Registered PC authentication failed: invalid completion");return;}
+                Event(AppEvent::Kind::LanStatus,"Registered PC authenticated; automatic connection");approved_=std::move(candidate);candidate.reset();return;
+            }
+            if(!c.outgoing&&c.authStage==1){
+                if(f.size()!=2||f[0]!="FTA-P2"||!TrustedPeers::Equal(f[1],TrustedPeers::Mac(c.key,"client|"+c.authentication))){Drop(candidate,"Registered PC authentication failed: key mismatch or replay");return;}
+                c.accepted=true;c.authStage=3;c.output="FTA-A2|"+id_+"|"+c.nonce+"|"+TrustedPeers::Mac(c.key,"accepted|"+c.authentication)+"\n";
+                Event(AppEvent::Kind::LanStatus,"Registered PC authenticated; automatic connection");return;
+            }
+            Drop(candidate,"Invalid registered PC authentication state");return;
+        }
         if(c.outgoing){if(f.size()!=3||(f[0]!="FTA-A1"&&f[0]!="FTA-N1")||!Hex(f[1])||f[2]!=c.nonce||(!c.expectedId.empty()&&c.expectedId!=f[1])){Drop(candidate,"Invalid connection approval");return;}
             if(f[0]=="FTA-N1"){Drop(candidate,"Connection rejected");return;}
             approved_=std::move(candidate);candidate.reset();return;
         }
         if(c.prompt){Drop(candidate,"Commands before approval are forbidden");return;}
-        if(f.size()!=4||f[0]!="FTA-C1"||!Hex(f[1])||f[1]==id_||!Hex(f[2])||!Name(f[3])){Drop(candidate,"Invalid connection greeting");return;}
+        if(f.size()!=4||(f[0]!="FTA-C1"&&f[0]!="FTA-C2")||!Hex(f[1])||f[1]==id_||!Hex(f[2])||!Name(f[3])){Drop(candidate,"Invalid connection greeting");return;}
         if(outbound_){if(id_<f[1]){Drop(candidate,"Simultaneous request: keeping outbound");return;}Drop(outbound_,"Simultaneous request: using inbound approval");}
-        c.peerId=f[1];c.nonce=f[2];c.prompt=true;c.token=++nextToken_;
+        c.peerId=f[1];c.nonce=f[2];
+        if(f[0]=="FTA-C2"){
+            c.key=trusted_.Key(c.ip);if(c.key.empty()){Drop(candidate,"Registered PC authentication failed: PC is not registered");return;}
+            c.greeting=f[0]+"|"+f[1]+"|"+f[2]+"|"+f[3];c.challenge=RandomId();c.authentication=c.greeting+"|"+id_+"|"+c.challenge;
+            c.output="FTA-H2|"+id_+"|"+c.challenge+"|"+TrustedPeers::Mac(c.key,"server|"+c.authentication)+"\n";c.authStage=1;return;
+        }
+        c.prompt=true;c.token=++nextToken_;
         Event(AppEvent::Kind::Consent,f[3]+" (unverified) / "+c.ip,c.token);return;
     }
 }
