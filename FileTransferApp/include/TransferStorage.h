@@ -37,6 +37,7 @@ struct TransferSpec {
     uint64_t size = 0;
     std::string name, digest, transferId;
     uint8_t mode = 0; // 0: fresh, 1: explicit resume, 2: completion query
+    std::string peerScope; // Local-only ownership; never encoded in file protocol v6.
     std::string Encode() const;
     std::string Identity() const;
     static TransferSpec Decode(std::string_view bytes);

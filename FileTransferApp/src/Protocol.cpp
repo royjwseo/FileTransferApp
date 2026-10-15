@@ -384,6 +384,7 @@ bool Protocol::ProcessMessage(MessageType type, std::string_view payload)
         TransferSpec spec;
         try { spec = TransferSpec::Decode(payload); }
         catch (const std::exception& e) { return FailFile(e.what()); }
+        spec.peerScope=peerScope_;
         const auto size = spec.size; const auto name = spec.name;
         if (size > MAX_FILE_SIZE || !FileName::IsSafe(name)) return FailFile("Invalid file metadata");
         incoming_ = { name, size, id, spec, generation_ };

@@ -6,11 +6,11 @@
 #include <mutex>
 #include <vector>
 
-struct DiscoveredPeer {std::string id,name,ip;uint16_t port=0;};
+struct DiscoveredPeer {std::string id,name,ip;uint16_t port=0;std::string peerId,role;};
 struct AppEvent {
-    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Download, Peers, Consent, LanStatus, Log };
+    enum class Kind { Connection, Text, Request, State, Progress, Identity, Selection, Download, Peers, Consent, LanStatus, Log, SessionAdded, SessionRemoved, Configuration };
     Kind kind = Kind::Log;
-    std::string text, name, transferId;
+    std::string text, name, transferId, peerId;
     uint64_t requestId = 0, total = 0;
     uint64_t session = 0;
     bool sending = false;
@@ -22,6 +22,7 @@ struct AppEvent {
 class EventQueue {
 public:
     static constexpr size_t CAPACITY = 256;
+    explicit EventQueue(size_t capacity=CAPACITY):capacity_(std::clamp(capacity,size_t(32),size_t(4096))){}
     void Push(AppEvent event) {
         if (event.text.size() > 16384) {
             event.text.resize(16384);
@@ -40,7 +41,7 @@ public:
             });
             if (old != queue_.end()) { *old = std::move(event); return; }
         }
-        if (queue_.size() == CAPACITY) {
+        if (queue_.size() == capacity_) {
             auto expendable = std::find_if(queue_.begin(), queue_.end(), [](const AppEvent& e) {
                 return e.kind == AppEvent::Kind::Text || e.kind == AppEvent::Kind::Log || e.kind == AppEvent::Kind::Progress;
             });
@@ -63,4 +64,5 @@ private:
     std::mutex mutex_;
     std::deque<AppEvent> queue_;
     size_t dropped_ = 0;
+    const size_t capacity_;
 };

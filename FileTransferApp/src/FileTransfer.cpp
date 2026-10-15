@@ -222,7 +222,8 @@ void TransferStorage::PinMetadataDirectory() {
     Require(bool(metadataDirectory_),"Cannot open metadata directory");FileIdentity(metadataDirectory_.value,true);
     // Directory identity avoids path aliases/case and separates identical transfer IDs in different destinations.
     Require(HexDigest(spec_.transferId),"Invalid metadata transfer identity");
-    Sha256 key;key.Add(FileIdentity(directory_.value,true));key.Add(spec_.transferId);
+    Require(spec_.peerScope.empty()||(spec_.peerScope.size()==32&&spec_.peerScope.find_first_not_of("0123456789abcdef")==spec_.peerScope.npos),"Invalid metadata peer scope");
+    Sha256 key;key.Add(FileIdentity(directory_.value,true));key.Add(spec_.transferId);key.Add(spec_.peerScope);
     manifestPath_=root/(key.Hex()+".fta");
 }
 std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spec, const std::filesystem::path& folder) {
@@ -243,7 +244,7 @@ std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spe
         Require(bool(store->data_), "Cannot create temporary file or temporary file exists");
         store->ownsData_ = true;
         const auto plain = spec.transferId + FileIdentity(store->data_.value) +
-            (folder.empty() ? std::string{} : FileIdentity(store->directory_.value, true));
+            (folder.empty() ? std::string{} : FileIdentity(store->directory_.value, true)) + spec.peerScope;
         DATA_BLOB input{ static_cast<DWORD>(plain.size()), reinterpret_cast<BYTE*>(const_cast<char*>(plain.data())) }, output{};
         Require(CryptProtectData(&input, L"FileTransferApp ownership", nullptr, nullptr, nullptr,
             CRYPTPROTECT_UI_FORBIDDEN, &output), "Cannot seal resume metadata");
@@ -271,7 +272,7 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     const DWORD metadataError=store->manifest_?ERROR_SUCCESS:GetLastError();
     bool migrating=false;
     // Only a missing central record permits the legacy lookup. Corruption/access failures never downgrade.
-    if(!store->manifest_&&(metadataError==ERROR_FILE_NOT_FOUND||metadataError==ERROR_PATH_NOT_FOUND)){
+    if(!store->manifest_&&spec.peerScope.empty()&&(metadataError==ERROR_FILE_NOT_FOUND||metadataError==ERROR_PATH_NOT_FOUND)){
         store->manifest_=OwnedHandle(CreateFileW(legacy.c_str(),GENERIC_READ|DELETE,0,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
         migrating=bool(store->manifest_);
     }
@@ -286,8 +287,8 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     Require(CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &output),
         "Resume metadata authentication failed");
     const std::string plain(reinterpret_cast<char*>(output.pbData), output.cbData); LocalFree(output.pbData);
-    Require((plain.size() == 80 || plain.size() == 96) && plain.substr(0, 64) == spec.transferId, "Resume transfer identity mismatch");
-    if (plain.size() == 96) Require(plain.substr(80) == FileIdentity(store->directory_.value, true), "Resume directory ownership mismatch");
+    Require((spec.peerScope.empty()?(plain.size()==80||plain.size()==96):(plain.size()==128&&plain.substr(96)==spec.peerScope))&&plain.substr(0,64)==spec.transferId,"Resume peer/transfer identity mismatch");
+    if (plain.size() >= 96) Require(plain.substr(80,16) == FileIdentity(store->directory_.value, true), "Resume directory ownership mismatch");
     store->complete_ = std::filesystem::exists(std::filesystem::symlink_status(store->final_));
     Require(spec.mode != 2 || store->complete_, "Transfer completion unknown");
     const auto path = store->complete_ ? store->final_ : store->part_;

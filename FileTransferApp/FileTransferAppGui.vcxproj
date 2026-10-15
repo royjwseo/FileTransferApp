@@ -25,6 +25,8 @@
     <ClInclude Include="include\ChatWindow.h" />
     <ClInclude Include="include\LanService.h" />
     <ClInclude Include="include\TrustedPeers.h" />
+    <ClInclude Include="include\PeerSettings.h" />
+    <ClInclude Include="include\MultiController.h" />
     <ClInclude Include="include\GuiSettings.h" />
     <ClInclude Include="include\FileName.h" />
     <ClInclude Include="include\TransferStorage.h" />
@@ -37,6 +39,7 @@
     <ClCompile Include="src\Gui.cpp" />
     <ClCompile Include="src\ChatWindow.cpp" />
     <ClCompile Include="src\LanService.cpp" />
+    <ClCompile Include="src\MultiLanService.cpp" />
     <ClCompile Include="src\Network.cpp" />
     <ClCompile Include="src\Protocol.cpp" />
   </ItemGroup>

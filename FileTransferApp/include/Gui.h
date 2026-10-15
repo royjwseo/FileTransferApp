@@ -1,3 +1,3 @@
 ﻿#pragma once
 #include <windows.h>
-int RunGui(HINSTANCE instance, int show, bool legacy = false);
+int RunGui(HINSTANCE instance, int show, bool legacy = false, bool compatibility = false);

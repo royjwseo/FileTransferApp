@@ -23,7 +23,8 @@ public sealed class GuiDriver : IDisposable {
     static string Class(IntPtr h){var b=new StringBuilder(128);GetClassName(h,b,b.Capacity);return b.ToString();}
     public GuiDriver(string exe,string cwd):this(exe,cwd,true) {}
     public GuiDriver(string exe,string cwd,bool seedSettings):this(exe,cwd,seedSettings,true) {}
-    public GuiDriver(string exe,string cwd,bool seedSettings,bool legacy){
+    public GuiDriver(string exe,string cwd,bool seedSettings,bool legacy):this(exe,cwd,seedSettings,legacy,false){}
+    public GuiDriver(string exe,string cwd,bool seedSettings,bool legacy,bool multiclient){
         Process=new Process {StartInfo=new ProcessStartInfo(exe){WorkingDirectory=cwd,UseShellExecute=false,WindowStyle=ProcessWindowStyle.Hidden}};
         string settings=System.IO.Path.Combine(cwd,"gui-settings.txt");
         Process.StartInfo.EnvironmentVariables["FILETRANSFER_GUI_SETTINGS"]=settings;
@@ -32,7 +33,7 @@ public sealed class GuiDriver : IDisposable {
             string received=System.IO.Path.Combine(cwd,"received");System.IO.Directory.CreateDirectory(received);
             System.IO.File.WriteAllText(settings,received,new UTF8Encoding(false));
         }
-        if(legacy)Process.StartInfo.Arguments="--legacy-cli";else Process.StartInfo.EnvironmentVariables["FILETRANSFER_LAN_PORT"]="0";
+        if(legacy)Process.StartInfo.Arguments="--legacy-cli";else {if(!multiclient)Process.StartInfo.Arguments="--compat-v1";Process.StartInfo.EnvironmentVariables["FILETRANSFER_LAN_PORT"]="0";}
         Process.Start();
         var watch=Stopwatch.StartNew();
         while(watch.ElapsedMilliseconds<5000){
@@ -80,8 +81,9 @@ public sealed class GuiDriver : IDisposable {
     public static string Downloads(){Guid id=new Guid("374DE290-123F-4565-9164-39C4925E467B");IntPtr path;int hr=SHGetKnownFolderPath(ref id,0,IntPtr.Zero,out path);if(hr!=0)Marshal.ThrowExceptionForHR(hr);try{return Marshal.PtrToStringUni(path);}finally{Marshal.FreeCoTaskMem(path);}}
     public bool Enabled(int id){return IsWindowEnabled(Control(id));}
     public void Resize(int width,int height){SetWindowPos(Window,IntPtr.Zero,0,0,width,height,6);Thread.Sleep(100);Responsive();}
-    public void Folder(string path,bool cancel=false){
-        Click(128);IntPtr dialog=IntPtr.Zero;var watch=Stopwatch.StartNew();
+    public void Folder(string path,bool cancel=false){Folder(path,cancel,128);}
+    public void Folder(string path,bool cancel,int button){
+        Click(button);IntPtr dialog=IntPtr.Zero;var watch=Stopwatch.StartNew();
         while(watch.ElapsedMilliseconds<5000){EnumWindows((h,d)=>{uint id;GetWindowThreadProcessId(h,out id);if(id==Process.Id&&Class(h)=="#32770")dialog=h;return true;},IntPtr.Zero);if(dialog!=IntPtr.Zero)break;Thread.Sleep(20);}
         if(dialog==IntPtr.Zero)throw new Exception("Folder dialog missing");
         if(cancel){PostMessage(dialog,0x111,new IntPtr(2),IntPtr.Zero);Thread.Sleep(200);return;}
@@ -89,10 +91,19 @@ public sealed class GuiDriver : IDisposable {
         EnumChildWindows(dialog,(h,d)=>{desc.Append(Class(h)+":"+GetDlgCtrlID(h)+" parent="+GetDlgCtrlID(GetParent(h))+"; ");if(Class(h)=="Edit"&&(GetDlgCtrlID(h)==1148||GetDlgCtrlID(GetParent(h))==1148||GetDlgCtrlID(h)==1152||GetDlgCtrlID(GetParent(h))==1152))edit=h;return true;},IntPtr.Zero);
         if(edit==IntPtr.Zero)throw new Exception("Folder edit missing: "+desc);
         SetHandle(edit,path);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);Thread.Sleep(300);PostMessage(dialog,0x111,new IntPtr(1),IntPtr.Zero);
-        Wait(127,path);
+        Wait(button==155?154:127,path);
     }
     public string[] Devices(){IntPtr r;if(SendMessageTimeout(GetDlgItem(Window,134),0x18b,IntPtr.Zero,"",2,1000,out r)==IntPtr.Zero)throw new Exception("List timeout");int count=r.ToInt32();var rows=new string[count];for(int i=0;i<count;i++){var b=new StringBuilder(1024);SendMessageTimeout(GetDlgItem(Window,134),0x189,new IntPtr(i),b,2,1000,out r);rows[i]=b.ToString();}return rows;}
     public void SelectDevice(int index){IntPtr r;SendMessageTimeout(GetDlgItem(Window,134),0x186,new IntPtr(index),"",2,1000,out r);}
+    public string[] List(int id){IntPtr r;var h=GetDlgItem(Window,id);SendMessageTimeout(h,0x18b,IntPtr.Zero,"",2,1000,out r);int count=r.ToInt32();var rows=new string[count];for(int i=0;i<count;i++){var b=new StringBuilder(1024);SendMessageTimeout(h,0x189,new IntPtr(i),b,2,1000,out r);rows[i]=b.ToString();}return rows;}
+    public void SelectSession(string peerId){var rows=List(152);for(int i=0;i<rows.Length;i++)if(rows[i].Contains("["+peerId.Substring(0,8)+"]")){IntPtr r;SendMessageTimeout(GetDlgItem(Window,152),0x186,new IntPtr(i),"",2,1000,out r);PostMessage(Window,0x111,new IntPtr((1<<16)|152),IntPtr.Zero);Thread.Sleep(150);return;}throw new Exception("Active session missing: "+peerId);}
+    public void SetRole(bool server){IntPtr r;SendMessageTimeout(GetDlgItem(Window,149),0x14e,new IntPtr(server?1:0),"",2,1000,out r);}
+    public void ApplyProfileWithConfirmation(bool accept){Click(151);IntPtr dialog=IntPtr.Zero;var w=Stopwatch.StartNew();while(w.ElapsedMilliseconds<5000){EnumWindows((h,d)=>{uint pid;GetWindowThreadProcessId(h,out pid);if(pid==Process.Id&&Class(h)=="#32770")dialog=h;return true;},IntPtr.Zero);if(dialog!=IntPtr.Zero)break;Thread.Sleep(20);}if(dialog==IntPtr.Zero)throw new Exception("Profile confirmation missing");PostMessage(dialog,0x111,new IntPtr(accept?1:2),IntPtr.Zero);Thread.Sleep(200);}
+    [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder b,int count);
+    public void UseChat(string peerId){IntPtr found=IntPtr.Zero;EnumWindows((h,d)=>{uint id;GetWindowThreadProcessId(h,out id);if(id==Process.Id&&Class(h)=="FileTransferAppChat"){var b=new StringBuilder(256);GetWindowText(h,b,b.Capacity);if(b.ToString().Contains("["+peerId.Substring(0,8)+"]"))found=h;}return true;},IntPtr.Zero);if(found==IntPtr.Zero)throw new Exception("Peer chat missing");Chat=found;}
+    public string ChatText(){return Read(GetDlgItem(Chat,108));}
+    public void StaleChatCommand(IntPtr source){PostMessage(Window,0x111,new IntPtr(110),source);}
+    public void ChatButton(){IntPtr r;if(SendMessageTimeout(Control(110),0xf5,IntPtr.Zero,IntPtr.Zero,2,1000,out r)==IntPtr.Zero)throw new Exception("Chat button timeout");}
     [DllImport("kernel32.dll",SetLastError=true)] static extern bool SetHandleInformation(IntPtr handle,uint mask,uint flags);
     public static void PreventInheritance(IntPtr handle){if(!SetHandleInformation(handle,1,0))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}
     public void Close(){PostMessage(Window,0x10,IntPtr.Zero,IntPtr.Zero);if(!Process.WaitForExit(7000))throw new Exception("GUI shutdown timed out");if(Process.ExitCode!=0)throw new Exception("GUI exit failure");}

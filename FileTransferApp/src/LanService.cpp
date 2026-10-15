@@ -52,9 +52,9 @@ LanService::LanService(std::shared_ptr<EventQueue> events):events_(std::move(eve
         Event(AppEvent::Kind::LanStatus,"LAN ready: "+id_+" TCP="+std::to_string(port_));
     }catch(...){Close(udp_);Close(listener_);WSACleanup();initialized_=false;throw;}
 }
-LanService::~LanService(){if(inbound_)Close(inbound_->socket);if(outbound_)Close(outbound_->socket);if(approved_)Close(approved_->socket);Close(listener_);Close(udp_);if(initialized_)WSACleanup();}
+LanService::~LanService(){CancelMulti();if(inbound_)Close(inbound_->socket);if(outbound_)Close(outbound_->socket);if(approved_)Close(approved_->socket);Close(listener_);Close(udp_);if(initialized_)WSACleanup();}
 void LanService::Event(AppEvent::Kind kind,std::string text,uint64_t token){AppEvent e;e.kind=kind;e.text=std::move(text);e.requestId=token;e.total=Pending()?1:0;events_->Push(std::move(e));}
-void LanService::Snapshot(){AppEvent e;e.kind=AppEvent::Kind::Peers;for(auto& [id,p]:peers_)e.peers.push_back({id,p.name,p.ip,p.port});events_->Push(std::move(e));}
+void LanService::Snapshot(){AppEvent e;e.kind=AppEvent::Kind::Peers;for(auto& [id,p]:peers_)e.peers.push_back({id,p.name,p.ip,p.port,p.peerId,p.role});events_->Push(std::move(e));}
 void LanService::SendDiscovery(char kind){const auto packet="FTA-DISC|1|"+std::string(1,kind)+"|"+id_+"|"+std::to_string(port_)+"|"+name_;if(udp_==INVALID_SOCKET)return;for(auto ip:interfaces_){if(!setsockopt(udp_,IPPROTO_IP,IP_MULTICAST_IF,reinterpret_cast<char*>(&ip),sizeof(ip)))sendto(udp_,packet.data(),static_cast<int>(packet.size()),0,reinterpret_cast<sockaddr*>(&group_),sizeof(group_));}}
 void LanService::Refresh(){nextSearch_=std::max(Clock::now(),lastSearch_+std::chrono::seconds(1));}
 void LanService::Datagram(std::string_view bytes,const sockaddr_in& source){

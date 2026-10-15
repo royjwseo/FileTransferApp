@@ -9,7 +9,7 @@ foreach($legacy in @($true,$false)){
  $dir=Join-Path $run ([string]$legacy);New-Item -ItemType Directory $dir | Out-Null
  $app=[GuiDriver]::new((Resolve-Path $Exe).Path,$dir,$true,$legacy)
  try {
-  $app.Resize(900,500);$h=$app.Window
+  $h=$app.Window;[ScrollProbe]::Display($h);$app.Resize(900,500)
   [ScrollProbe]::Bar($h,6);$base=[ScrollProbe]::Y($h,101)
   for($i=0;$i -lt 40;$i++){[ScrollProbe]::Wheel($h,-120);[ScrollProbe]::Wheel($h,120)}
   Check (([ScrollProbe]::State($h)).pos -eq 0) "wheel cycles return to top legacy=$legacy"

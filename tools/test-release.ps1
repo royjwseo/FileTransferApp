@@ -14,20 +14,29 @@ try {
   & $msbuild FileTransferApp/FileTransferApp.vcxproj /m "/p:Configuration=$cfg" /p:Platform=x64 "/p:ForceImportBeforeCppTargets=$RepositoryRoot/tests/Stage4Faults.props" "/p:OutDir=$run/fault/$cfg/bin/" "/p:IntDir=$run/fault/$cfg/obj/" /v:minimal *> "$run/fault-$cfg.log"
   if($LASTEXITCODE -ne 0){throw "Fault build failed: $cfg"}
   $cli="x64/$cfg/FileTransferApp.exe";$gui="FileTransferApp/x64/$cfg/FileTransferAppGui.exe"
-  foreach($test in @('stage1','stage2','stage3','stage3_validation','stage4','stage5_cancel','stage5_reconnect','stage5_resume','stage5_boundaries','stage6_unicode','stage7_gui','stage7_advanced','stage7_1_download','stage8_lan','gui_scroll','chat_auto_receive','auto_receive_wire','trusted_peers','metadata_storage')) {
+  $cliBlocked=$false;$guiBlocked=$false
+  foreach($test in @('stage1','stage2','stage3','stage3_validation','stage4','stage5_cancel','stage5_reconnect','stage5_resume','stage5_boundaries','stage6_unicode','stage7_gui','stage7_advanced','stage7_1_download','stage8_lan','gui_scroll','chat_auto_receive','auto_receive_wire','trusted_peers','metadata_storage','n_to_1','n1_auth','n1_storage','n1_settings','n1_lifecycle','n1_gui')) {
    $exe=if($test -in @('stage1','stage2','stage3','stage3_validation','stage4','stage5_cancel','stage5_reconnect','stage5_resume','stage5_boundaries','stage6_unicode','metadata_storage')){$cli}else{$gui}
    $argsList=@('-NoProfile','-ExecutionPolicy','RemoteSigned','-File',"tests/$test.ps1",'-Exe',$exe)
    if($test -eq 'stage4'){$argsList+=@('-FaultExe',"$run/fault/$cfg/bin/FileTransferApp.exe")}
    if($test -eq 'stage7_1_download'){$argsList+=@('-Cli',$cli)}
-   $started=Get-Date
-   $ErrorActionPreference='Continue'
-   & powershell @argsList *> "$run/$test-$cfg.log"
-   $ErrorActionPreference='Stop'
-   $exitCode=$LASTEXITCODE
-   $expected=@{stage1=12;stage2=20;stage3=27;stage3_validation=16;stage4=19;stage5_cancel=6;stage5_reconnect=4;stage5_resume=12;stage5_boundaries=5;stage6_unicode=43;stage7_gui=10;stage7_advanced=8;stage7_1_download=17;stage8_lan=25;gui_scroll=32;chat_auto_receive=16;auto_receive_wire=15;trusted_peers=14;metadata_storage=5}[$test]
+   $started=Get-Date;$skipped=($exe -eq $cli -and $cliBlocked)-or($exe -eq $gui -and $guiBlocked)-or($test -eq 'stage7_1_download' -and $cliBlocked)
+   if($skipped){"BLOCKED: dependent executable was already denied by Application Control; not retried." | Set-Content "$run/$test-$cfg.log";$exitCode=125}
+   else{
+    $ErrorActionPreference='Continue'
+    & powershell @argsList *> "$run/$test-$cfg.log"
+    $ErrorActionPreference='Stop'
+    $exitCode=$LASTEXITCODE
+    $failureText=Get-Content -LiteralPath "$run/$test-$cfg.log" -Raw
+    if($failureText -match 'Application Control policy has blocked'){
+     if($failureText -match '\[GuiDriver\]::new'){$guiBlocked=$true}
+     elseif($test -ne 'stage4'){$cliBlocked=$true}
+    }
+   }
+   $expected=@{stage1=12;stage2=20;stage3=27;stage3_validation=16;stage4=19;stage5_cancel=6;stage5_reconnect=4;stage5_resume=12;stage5_boundaries=5;stage6_unicode=43;stage7_gui=10;stage7_advanced=8;stage7_1_download=17;stage8_lan=25;gui_scroll=32;chat_auto_receive=16;auto_receive_wire=15;trusted_peers=14;metadata_storage=5;n_to_1=18;n1_auth=14;n1_storage=11;n1_settings=10;n1_lifecycle=5;n1_gui=16}[$test]
    $count=@(Select-String -LiteralPath "$run/$test-$cfg.log" -Pattern '^PASS:').Count
 
-   $summary += [PSCustomObject]@{configuration=$cfg;test=$test;exitCode=$exitCode;pass=$count;expected=$expected}
+   $summary += [PSCustomObject]@{configuration=$cfg;test=$test;exitCode=$exitCode;pass=$count;expected=$expected;skipped=$skipped}
    $summary | ConvertTo-Json | Set-Content "$run/results.json" -Encoding UTF8
    Write-Output "$cfg $test exit=$exitCode PASS=$count/$expected"
    if($exitCode -ne 0 -or $count -ne $expected){

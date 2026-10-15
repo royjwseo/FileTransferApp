@@ -26,6 +26,7 @@ public:
     // Set before starting workers. Setup polls with a bounded wait for GUI use.
     void SetEvents(std::shared_ptr<EventQueue> events, uint64_t session = 0) { events_ = events; eventSession_ = session; protocol_.SetEvents(std::move(events), session); }
     void EnableInterruptibleSetup() { interruptibleSetup_ = true; }
+    void SetPeerScope(std::string id) { protocol_.SetPeerScope(std::move(id)); } // Before workers/adoption.
 
     bool StartServer(uint16_t port, const std::string& bindIp = "0.0.0.0");
     bool Connect(const std::string& ip, uint16_t port);

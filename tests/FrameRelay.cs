@@ -29,8 +29,11 @@ public sealed class FrameRelay : IDisposable {
     TcpClient ackTarget;
     object ackWrite;
     public readonly int Port;
+    readonly bool consentGate;
 
-    public FrameRelay(int targetPort) {
+    public FrameRelay(int targetPort):this(targetPort,false){}
+    public FrameRelay(int targetPort,bool gate) {
+        consentGate=gate;
         listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         Isolate(listener.Server);
@@ -72,7 +75,12 @@ public sealed class FrameRelay : IDisposable {
             Stream input = source.GetStream();
             long forwarded = 0;
             while (!stopped) {
-                byte[] header = Exact(input, 5);
+                byte[] header;
+                if(consentGate){
+                    int first=input.ReadByte();if(first<0)throw new EndOfStreamException();
+                    if(first==70){var line=new MemoryStream();line.WriteByte((byte)first);while(line.Length<=512){int b=input.ReadByte();if(b<0)throw new EndOfStreamException();line.WriteByte((byte)b);if(b==10)break;}if(line.Length>513)throw new IOException("Oversized consent line");var bytes=line.ToArray();lock(writeLock){target.GetStream().Write(bytes,0,bytes.Length);}continue;}
+                    header=new byte[5];header[0]=(byte)first;Array.Copy(Exact(input,4),0,header,1,4);
+                }else header=Exact(input, 5);
                 int length = (header[1] << 24) | (header[2] << 16) | (header[3] << 8) | header[4];
                 if (length < 0 || length > 1024 * 1024) throw new IOException("Invalid relay frame length");
                 byte[] payload = Exact(input, length);

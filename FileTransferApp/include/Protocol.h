@@ -45,6 +45,7 @@ public:
     static std::string WithRequestId(uint64_t id, std::string_view payload = {});
     void Configure(bool host);
     void SetEvents(std::shared_ptr<EventQueue> events, uint64_t session = 0) { events_ = std::move(events); eventSession_ = session; }
+    void SetPeerScope(std::string id) { peerScope_=std::move(id); }
     uint64_t StartOutgoing(const std::string& name, const TransferSpec& spec);
     uint64_t ResumeOffset() const { return resumeOffset_; }
     std::string ResumeDigest() const { return resumeDigest_; }
@@ -94,5 +95,6 @@ private:
     bool recoverableError_ = false;
     std::shared_ptr<EventQueue> events_;
     uint64_t eventSession_ = 0;
+    std::string peerScope_;
     void EventState(const char* text, bool sending, uint64_t id);
 };

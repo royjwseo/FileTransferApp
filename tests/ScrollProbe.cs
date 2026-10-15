@@ -16,6 +16,7 @@ public static class ScrollProbe {
  [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h,IntPtr dc);
  [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dest,int x,int y,int w,int h,IntPtr src,int sx,int sy,uint op);
  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h,int cmd);
+ public static void Display(IntPtr h){ShowWindow(h,5);Thread.Sleep(150);}
  public static Info State(IntPtr h){Info i=new Info{cb=(uint)Marshal.SizeOf(typeof(Info)),mask=23};if(!GetScrollInfo(h,1,ref i))throw new Exception("scroll info");return i;}
  public static int Y(IntPtr h,int id){Rect r;GetWindowRect(GetDlgItem(h,id),out r);MapWindowPoints(IntPtr.Zero,h,ref r,2);return r.top;}
  public static void Bar(IntPtr h,int cmd){SendMessage(h,0x115,new IntPtr(cmd),IntPtr.Zero);}

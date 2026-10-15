@@ -23,7 +23,8 @@ namespace {
 enum Id { Ip=101, Port, Host, Connect, Disconnect, Reconnect, Status, Transcript,
     Message, SendText, Pick, Selected, SendFile, DropSelect, Request, Accept, Reject,
     CancelSend, CancelReceive, SendProgress, ReceiveProgress, SendDetails, ReceiveDetails,
-    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus, OpenChat, ActivityLog, AutoInfo, RegisterPeer, ForgetPeer, RegistrationKey, TrustInfo };
+    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus, OpenChat, ActivityLog, AutoInfo, RegisterPeer, ForgetPeer, RegistrationKey, TrustInfo,
+    Role, DisplayName, ApplyProfile, ActiveClients, PeerInfo, PeerFolder, ChangePeerFolder, ResetPeerFolder, LocalInfo, SetDestination, SessionCount };
 struct Command {
     int type = 0; std::string text, path, transferId;
     uint64_t id = 0, session = 0; uint16_t port = 9000;
@@ -32,13 +33,15 @@ struct Command {
 class Controller {
 public:
     explicit Controller(std::shared_ptr<EventQueue> events, bool legacy) : events_(std::move(events)), legacy_(legacy), worker_([this]{ Loop(); }) {}
+    Controller(std::shared_ptr<EventQueue> events,LanService::Approved approved,uint64_t session,std::filesystem::path folder,bool createFolder)
+        :events_(std::move(events)),session_(session),downloadFolder_(std::move(folder)),sessionOnly_(true),createFolder_(createFolder),initial_(std::move(approved)),worker_([this]{Loop();}){}
     ~Controller() { Close(); if (worker_.joinable()) worker_.join(); }
     bool Post(Command command) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stop_ || commands_.size() >= 64) return false;
         commands_.push_back(std::move(command)); cv_.notify_one(); return true;
     }
-    void Close() { stop_ = true; cv_.notify_all(); }
+    void Close() { stop_ = true; cv_.notify_all();if(sessionOnly_&&worker_.joinable())CancelSynchronousIo(worker_.native_handle()); }
     bool Done() const { return done_; }
 private:
     std::shared_ptr<EventQueue> events_;
@@ -55,12 +58,15 @@ private:
     std::filesystem::path downloadFolder_;
     std::deque<Command> textQueue_; // Manager-thread-only; preserves chat order.
     bool legacy_=false;
+    bool sessionOnly_=false,createFolder_=false;
+    std::optional<LanService::Approved> initial_;
     std::unique_ptr<LanService> lan_;
     std::atomic<bool> legacyRunning_{false};
     void Adopt(LanService::Approved approved) {
         struct SocketGuard {SOCKET value;~SocketGuard(){if(value!=INVALID_SOCKET)closesocket(value);}} guard{approved.socket};
-        EndSession();++session_;network_=std::make_unique<Network>();
+        EndSession();if(!sessionOnly_)++session_;network_=std::make_unique<Network>();
         network_->SetEvents(events_,session_);
+        if(sessionOnly_)network_->SetPeerScope(approved.peerId);
         if(!network_->Initialize()){Emit(AppEvent::Kind::Connection,"Failed: initialization");return;}
         guard.value=INVALID_SOCKET; // Network consumes the socket, including setup failures.
         if(!network_->AdoptApprovedSocket(approved.socket,approved.host)){Emit(AppEvent::Kind::Connection,"Failed: approved socket setup");Emit(AppEvent::Kind::LanStatus,"Connection request failed: socket setup");return;}
@@ -68,11 +74,16 @@ private:
         receiver_=std::thread([this]{network_->ReceiveLoop();});
     }
     std::thread worker_; // Start only after every field used by Loop is initialized.
+    void EnsurePeerFolder(const std::filesystem::path& folder){
+        if(folder.empty()||!folder.is_absolute())throw std::runtime_error("Invalid default peer folder");
+        auto parent=folder.parent_path();TransferStorage::ValidateDirectory(parent.parent_path());std::filesystem::create_directory(parent);TransferStorage::ValidateDirectory(parent);std::filesystem::create_directory(folder);
+    }
     void Emit(AppEvent::Kind kind, std::string text, bool sending = false) {
         AppEvent e; e.kind = kind; e.text = std::move(text); e.session = session_; e.sending = sending; events_->Push(std::move(e));
     }
     void EndSession() {
         endingSession_ = true;
+        preparationCancelled_=true;
         if (network_) network_->RequestStop();
         if (sender_.joinable()) sender_.join();
         if (action_.joinable()) action_.join();
@@ -131,7 +142,7 @@ private:
         });
     }
     void DownloadEvent() {
-        AppEvent e;e.kind=AppEvent::Kind::Download;e.text=FileName::ToUtf8(downloadFolder_.wstring());events_->Push(std::move(e));
+        AppEvent e;e.kind=AppEvent::Kind::Download;e.text=FileName::ToUtf8(downloadFolder_.wstring());e.session=session_;events_->Push(std::move(e));
     }
     void AutoReceive() {
         if(legacy_ || preparing_ || !network_ || !network_->IsConnected())return;
@@ -158,6 +169,10 @@ private:
         });
     }
     void Process(Command c) {
+        if(c.type==SetDestination){
+            try{auto folder=std::filesystem::path(FileName::ToWide(c.path));if(c.id)EnsurePeerFolder(folder);TransferStorage::ValidateDirectory(folder);downloadFolder_=std::move(folder);DownloadEvent();}
+            catch(const std::exception& e){downloadFolder_.clear();DownloadEvent();Emit(AppEvent::Kind::Log,std::string("Peer download folder error: ")+e.what());}return;
+        }
         if(c.type==RegisterPeer||c.type==ForgetPeer){
             try{if(lan_){if(c.type==RegisterPeer)lan_->RegisterPeer(c.text,c.path);else lan_->ForgetPeer(c.text);}}
             catch(const std::exception& e){Emit(AppEvent::Kind::Log,std::string("PC registration failed: ")+e.what());}return;
@@ -165,7 +180,11 @@ private:
         if(c.type==RefreshDevices){if(lan_)lan_->Refresh();return;}
         if(c.type==ConsentAccept||c.type==ConsentReject){if(lan_)lan_->Decide(c.id,c.type==ConsentAccept);return;}
         if(c.type==RequestConnect||c.type==DirectConsent){
-            if(lan_&&(!network_||!network_->IsConnected())&&!legacyRunning_)lan_->Request(c.text,c.port,c.transferId);
+            if(lan_&&(!network_||!network_->IsConnected())&&!legacyRunning_){
+                // ReceiveLoop can report disconnect while this worker is in its
+                // command wait. Refresh the gate's busy snapshot before retry.
+                lan_->Poll(sending_||acting_||preparing_);lan_->Request(c.text,c.port,c.transferId);
+            }
             else Emit(AppEvent::Kind::LanStatus,"Connection request refused: already connected or busy");return;
         }
         if(c.type==ChangeFolder) {
@@ -185,6 +204,7 @@ private:
                 AppEvent e; e.kind=AppEvent::Kind::Selection; e.text=c.path; e.total=size;
                 e.name=FileName::ToUtf8(std::filesystem::path(FileName::ToWide(c.path)).filename().wstring());e.requestId=c.id;
                 if (!FileName::IsSafe(e.name)) throw std::runtime_error("Unsupported or unsafe filename");
+                e.session=session_;
                 events_->Push(std::move(e));
             } catch (const std::exception& e) { Emit(AppEvent::Kind::Log,std::string("Cannot select file: ")+e.what()); }
             return;
@@ -202,9 +222,12 @@ private:
     void Loop() {
         try {
             try {
-                downloadFolder_=GuiSettings::Load();TransferStorage::ValidateDirectory(downloadFolder_);DownloadEvent();
+                if(!sessionOnly_)downloadFolder_=GuiSettings::Load();
+                if(sessionOnly_&&createFolder_)EnsurePeerFolder(downloadFolder_);
+                TransferStorage::ValidateDirectory(downloadFolder_);DownloadEvent();
             }catch(const std::exception& e){downloadFolder_.clear();DownloadEvent();Emit(AppEvent::Kind::Log,std::string("Download folder error: ")+e.what());}
-            if(!legacy_){try{lan_=std::make_unique<LanService>(events_);}catch(const std::exception& e){Emit(AppEvent::Kind::LanStatus,std::string("LAN unavailable: ")+e.what());}}
+            if(sessionOnly_&&initial_){auto approved=std::move(*initial_);initial_.reset();Adopt(std::move(approved));}
+            if(!legacy_&&!sessionOnly_){try{lan_=std::make_unique<LanService>(events_);}catch(const std::exception& e){Emit(AppEvent::Kind::LanStatus,std::string("LAN unavailable: ")+e.what());}}
             while (!stop_) {
                 if(lan_){
                     lan_->Poll((network_&&network_->IsConnected())||legacyRunning_||sending_||acting_||preparing_);
@@ -224,11 +247,14 @@ private:
                     else Emit(AppEvent::Kind::Log,"Queued message discarded after disconnect.");
                 }
                 AutoReceive();
+                if(sessionOnly_&&network_&&!network_->IsConnected())break;
             }
         } catch (const std::exception& e) { Emit(AppEvent::Kind::Log,std::string("Session error: ")+e.what()); }
         lan_.reset();EndSession(); done_=true;
     }
 };
+
+#include "MultiController.h"
 
 std::wstring Text(HWND control) {
     const int n = GetWindowTextLengthW(control);
@@ -239,17 +265,34 @@ std::wstring Wide(const std::string& value) {
 }
 struct Window {
     HWND hwnd=nullptr; HINSTANCE instance=nullptr; bool legacy=false;
+    bool multi=true,server=false,restoreTransferId=false,clientsDirty=false;
+    std::unique_ptr<MultiController> multiController;
+    struct PeerView {
+        uint64_t session=0;std::string id,name,ip,folder,editedId;
+        bool active=false,connected=false,sendBusy=false,receiveBusy=false;size_t unread=0;
+        std::unique_ptr<ChatWindow> chat;
+        std::deque<AppEvent> cache;
+    };
+    std::map<std::string,PeerView> views;
+    std::string selectedPeer;
+    std::vector<std::string> activeRows;
+    std::map<uint64_t,AppEvent> consents;
+    std::vector<AppEvent> replay;
     std::vector<DiscoveredPeer> peers; uint64_t consentToken=0;
-    std::shared_ptr<EventQueue> events=std::make_shared<EventQueue>();
+    std::shared_ptr<EventQueue> events=std::make_shared<EventQueue>(4096);
     std::unique_ptr<Controller> controller;
     ChatWindow chat;
+    ChatWindow& Chat(){auto i=views.find(selectedPeer);return multi&&i!=views.end()?*i->second.chat:chat;}
+    bool Post(Command c){return multi?multiController->Post(std::move(c)):controller->Post(std::move(c));}
+    void CloseController(){if(multi)multiController->Close();else controller->Close();}
+    bool ControllerDone(){return multi?multiController->Done():controller->Done();}
     uint64_t session=0, incoming=0, outgoing=0;
     uint64_t selection=0, sendTerminal=0, receiveTerminal=0;
     bool closing=false, selectedValid=false, connected=false, connecting=false, sendBusy=false, pendingApproval=false;
     UINT dpi=96; HFONT font=nullptr; int scrollY=0; bool downloadReady=false, lanPending=false;
     std::wstring path;
     std::wstring sendMetrics, receiveMetrics, sendState, receiveState;
-    HWND Get(int id) { return id==Transcript||id==Message||id==SendText ? chat.Control(id) : GetDlgItem(hwnd,id); }
+    HWND Get(int id) { return id==Transcript||id==Message||id==SendText ? Chat().Control(id) : GetDlgItem(hwnd,id); }
     void Set(int id,const std::wstring& text) { SetWindowTextW(Get(id),text.c_str()); }
     void Log(std::wstring text) {
         text += L"\r\n";
@@ -262,11 +305,81 @@ struct Window {
             WS_CHILD|WS_VISIBLE|WS_TABSTOP|extra,x,y,w,h,hwnd,reinterpret_cast<HMENU>(INT_PTR(id)),instance,nullptr);
         SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)),TRUE);
     }
-    ~Window(){controller.reset();if(font)DeleteObject(font);}
+    ~Window(){multiController.reset();controller.reset();if(font)DeleteObject(font);}
+    void RefreshPeerInfo(){
+        auto i=views.find(selectedPeer);
+        if(i==views.end()){Set(PeerInfo,L"연결된 상대를 선택하세요.");Set(PeerFolder,L"");return;}
+        auto& v=i->second;Set(PeerInfo,Wide(v.name)+L"\r\n"+(v.connected?L"연결됨":L"연결 종료/준비 중")+L"\r\nPeerId: "+Wide(v.id));
+        Set(PeerFolder,L"현재 수신 폴더: "+Wide(v.folder));
+    }
+    void ChoosePeer(const std::string& id){
+        if(id==selectedPeer)return;
+        auto old=views.find(selectedPeer);if(old!=views.end())old->second.editedId=FileName::ToUtf8(Text(Get(TransferId)));
+        selectedPeer=id;session=0;connected=connecting=sendBusy=pendingApproval=selectedValid=false;
+        incoming=outgoing=sendTerminal=receiveTerminal=0;sendMetrics.clear();receiveMetrics.clear();sendState.clear();receiveState.clear();path.clear();replay.clear();
+        Set(Selected,L"파일을 선택하세요.");Set(Request,L"수신 요청 없음");Set(SendDetails,L"송신 대기");Set(ReceiveDetails,L"수신 대기");Set(TransferId,L"");Set(Status,L"연결 안 됨");
+        for(int id:{SendProgress,ReceiveProgress})SendMessageW(Get(id),PBM_SETPOS,0,0);
+        auto i=views.find(id);if(i!=views.end()){session=i->second.session;for(auto& e:i->second.cache){replay.push_back(e);if(e.kind==AppEvent::Kind::Selection)selection=e.requestId;}restoreTransferId=true;}
+        RefreshPeerInfo();clientsDirty=true;Buttons();
+    }
+    void RefreshClients(){
+        if(!multi||!clientsDirty)return;clientsDirty=false;activeRows.clear();SendMessageW(Get(ActiveClients),LB_RESETCONTENT,0,0);
+        for(auto& [id,v]:views)if(v.active){auto text=Wide(v.name)+L" ["+Wide(id.substr(0,8))+L"] "+(v.connected?L"연결됨":L"준비 중");
+            if(v.sendBusy)text+=L" / 송신 중";if(v.receiveBusy)text+=L" / 수신 중";if(v.unread)text+=L" / 새 메시지 "+std::to_wstring(v.unread);
+            SendMessageW(Get(ActiveClients),LB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str()));if(id==selectedPeer)SendMessageW(Get(ActiveClients),LB_SETCURSEL,activeRows.size(),0);activeRows.push_back(id);}
+        Set(SessionCount,(server?L"연결된 클라이언트 ":L"연결된 서버 ")+std::to_wstring(activeRows.size())+(server?L"/10":L"/1"));
+        RefreshPeerInfo();
+    }
+    void ChatSend(HWND source){
+        if(closing)return;
+        if(!multi){CommandClick(SendText);return;}
+        for(auto& [id,v]:views)if(v.chat->Handle()==source){if(!v.connected||!v.active)return;auto text=Text(v.chat->Control(Message));if(text.empty())return;
+            Command c;c.type=SendText;c.session=v.session;c.text=FileName::ToUtf8(text);if(Post(std::move(c)))SetWindowTextW(v.chat->Control(Message),L"");else Log(L"상대 메시지 큐가 가득 찼습니다.");return;}
+    }
+    std::vector<AppEvent> FilterEvents(std::vector<AppEvent> incomingEvents){
+        if(!multi)return incomingEvents;std::vector<AppEvent> selected;selected.swap(replay);
+        for(auto& e:incomingEvents){
+            if(e.kind==AppEvent::Kind::Configuration){server=e.total!=0;ChoosePeer("");consents.clear();consentToken=0;lanPending=false;Set(ConsentText,L"연결 요청 없음");SendMessageW(Get(Role),CB_SETCURSEL,server?1:0,0);Set(DisplayName,Wide(e.name));Set(LocalInfo,L"내 PeerId: "+Wide(e.peerId)+L" / "+(server?L"서버 (최대 10명)":L"클라이언트"));if(!e.text.empty())Log(Wide(e.text));continue;}
+            if(e.kind==AppEvent::Kind::Consent){
+                if(e.text.empty())consents.erase(e.requestId);else consents[e.requestId]=e;
+                consentToken=consents.empty()?0:consents.begin()->first;Set(ConsentText,consents.empty()?L"연결 요청 없음":L"승인 대기 "+std::to_wstring(consents.size())+L"건: "+Wide(consents.begin()->second.text));continue;
+            }
+            if(e.kind==AppEvent::Kind::SessionAdded){
+                if(!views.contains(e.peerId)&&views.size()>=32){auto oldest=views.end();for(auto i=views.begin();i!=views.end();++i)if(!i->second.active&&i->first!=selectedPeer&&(oldest==views.end()||i->second.session<oldest->second.session))oldest=i;if(oldest!=views.end()){Log(L"오래된 비활성 대화 기록을 정리합니다 (최대 32명).");views.erase(oldest);}}
+                auto& v=views[e.peerId];std::wstring history,draft;bool visible=false;RECT previous{};
+                if(v.chat){history=Text(v.chat->Control(Transcript));draft=Text(v.chat->Control(Message));visible=IsWindowVisible(v.chat->Handle())!=FALSE;GetWindowRect(v.chat->Handle(),&previous);}
+                auto replacement=std::make_unique<ChatWindow>();replacement->Create(hwnd,instance);SetWindowTextW(replacement->Control(Transcript),history.c_str());SetWindowTextW(replacement->Control(Message),draft.c_str());v.chat=std::move(replacement);
+                v.id=e.peerId;v.name=e.name;v.ip=e.text;v.folder=e.transferId;v.session=e.session;v.active=true;v.connected=false;v.cache.clear();v.editedId.clear();v.sendBusy=v.receiveBusy=false;v.chat->SetPeerName(Wide(v.name)+L" ["+Wide(v.id.substr(0,8))+L"]");
+                if(visible){SetWindowPos(v.chat->Handle(),nullptr,previous.left,previous.top,previous.right-previous.left,previous.bottom-previous.top,SWP_NOZORDER|SWP_NOACTIVATE);v.chat->Open();}
+                clientsDirty=true;if(selectedPeer==v.id){selectedPeer.clear();ChoosePeer(v.id);}else if(selectedPeer.empty()||!server)ChoosePeer(v.id);continue;
+            }
+            // Manager diagnostics have no session. Do not discard them through
+            // the selected connection's legacy SessionId filter below.
+            if(e.session==0&&e.kind==AppEvent::Kind::Log){Log(Wide(e.text));continue;}
+            if(e.session){
+                auto i=views.find(e.peerId);if(i==views.end()||i->second.session!=e.session)continue;auto& v=i->second;
+                if(e.kind==AppEvent::Kind::SessionRemoved){v.active=v.connected=false;v.chat->SetConnected(false);clientsDirty=true;
+                    if(v.id==selectedPeer){AppEvent ended;ended.kind=AppEvent::Kind::Connection;ended.session=e.session;ended.text="Disconnected";selected.push_back(std::move(ended));}continue;}
+                if(e.kind==AppEvent::Kind::Text){v.chat->Append(L"상대: "+Wide(e.text));if(GetForegroundWindow()!=v.chat->Handle()){++v.unread;clientsDirty=true;}continue;}
+                if(e.kind==AppEvent::Kind::Log){if(e.text.starts_with("Sent: "))v.chat->Append(L"나: "+Wide(e.text.substr(6)));else Log(L"["+Wide(v.name)+L"] "+Wide(e.text));continue;}
+                if(e.kind==AppEvent::Kind::Download){if(!e.name.empty())v.folder=e.name;else if(!e.text.empty())v.folder=e.text;if(e.text.empty())Log(L"["+Wide(v.name)+L"] 수신 경로 오류: 자동 수신 불가");RefreshPeerInfo();continue;}
+                if(e.kind==AppEvent::Kind::Connection){v.connected=e.text.starts_with("Connected:");v.chat->SetConnected(v.connected);clientsDirty=true;}
+                if(e.kind==AppEvent::Kind::Identity)v.editedId=e.transferId;
+                if(e.kind==AppEvent::Kind::Progress){if(e.sending)v.sendBusy=true;else v.receiveBusy=true;clientsDirty=true;}
+                if(e.kind==AppEvent::Kind::Request){v.receiveBusy=true;clientsDirty=true;}
+                if(e.kind==AppEvent::Kind::State){bool busy=!(e.text.starts_with("Completed")||e.text.starts_with("Cancelled")||e.text.starts_with("Failed")||e.text.starts_with("Saved"));if(e.sending)v.sendBusy=busy;else v.receiveBusy=busy;clientsDirty=true;}
+                std::erase_if(v.cache,[&](const AppEvent& old){return old.kind==e.kind&&old.sending==e.sending;});v.cache.push_back(e);
+                if(v.id==selectedPeer)selected.push_back(std::move(e));continue;
+            }
+            selected.push_back(std::move(e));
+        }
+        if(!replay.empty()){selected.insert(selected.begin(),replay.begin(),replay.end());replay.clear();}
+        RefreshClients();return selected;
+    }
     int Scale(int n) const {return MulDiv(n,dpi,96);}
     void Layout() {
         if(!Get(Ip))return;
-        RECT r{};GetClientRect(hwnd,&r);int top=legacy?0:285;
+        RECT r{};GetClientRect(hwnd,&r);int top=legacy?0:(multi?555:285);
         SCROLLINFO si{sizeof(si),SIF_RANGE|SIF_PAGE|SIF_POS};si.nMax=Scale(795+top)-1;si.nPage=r.bottom;si.nPos=scrollY;SetScrollInfo(hwnd,SB_VERT,&si,TRUE);si.fMask=SIF_POS;GetScrollInfo(hwnd,SB_VERT,&si);scrollY=si.nPos;
         // SetScrollInfo can show/hide the bar and change the client width.
         GetClientRect(hwnd,&r);
@@ -287,11 +400,14 @@ struct Window {
         };
         auto move=[&](int id,int x,int y,int cw,int ch){place(id,x,y+top,cw,ch);};
         if(!legacy){
-            auto lane=[&](int id,int x,int y,int cw,int ch){place(id,x,y,cw,ch);};
+            auto lane=[&](int id,int x,int y,int cw,int ch){place(id,x,y+(multi?100:0),cw,ch);};
             lane(LanGroup,10,5,w-20,275);lane(Devices,25,28,w-210,83);lane(RefreshDevices,w-175,28,145,29);lane(RequestConnect,w-175,66,145,29);
             lane(LanStatus,25,115,w-50,26);lane(ConsentText,25,148,w-250,45);lane(ConsentAccept,w-215,153,90,30);lane(ConsentReject,w-115,153,90,30);
             lane(RegistrationKey,25,200,w-340,27);lane(RegisterPeer,w-300,200,130,29);lane(ForgetPeer,w-160,200,130,29);
-            lane(TrustInfo,25,237,w-50,32);lane(DirectConsent,280,top+29,150,29);
+            lane(TrustInfo,25,237,w-50,32);place(DirectConsent,280,top+29,150,29);
+            if(multi){place(Role,25,20,140,200);place(DisplayName,175,20,w-340,27);place(ApplyProfile,w-155,20,130,29);place(LocalInfo,25,60,w-50,32);
+                place(SessionCount,25,377,w-50,18);
+                place(ActiveClients,25,395,w-300,85);place(PeerInfo,w-260,395,235,90);place(PeerFolder,25,495,w-310,45);place(ChangePeerFolder,w-270,500,120,29);place(ResetPeerFolder,w-140,500,115,29);}
         }
         move(ConnectionGroup,10,5,w-20,93);move(Ip,25,29,170,27);move(Port,205,29,65,27);
         move(Host,280,29,100,29);move(Connect,390,29,75,29);move(Disconnect,475,29,100,29);move(Reconnect,585,29,90,29);move(Status,25,65,width,24);
@@ -315,14 +431,20 @@ struct Window {
     void Buttons() {
         auto enable=[&](int id,bool on){EnableWindow(Get(id),on&&!closing);};
         enable(Host,legacy&&!connected&&!connecting);enable(Connect,legacy&&!connected&&!connecting);enable(Disconnect,connected||connecting||lanPending);enable(Reconnect,legacy&&!connected&&!connecting);
-        enable(RequestConnect,!connected&&!lanPending&&consentToken==0);enable(DirectConsent,!connected&&!lanPending&&consentToken==0);enable(ConsentAccept,!connected&&consentToken!=0);enable(ConsentReject,consentToken!=0);
-        enable(RegisterPeer,!legacy&&!connected&&!lanPending);enable(ForgetPeer,!legacy&&!connected&&!lanPending);enable(RegistrationKey,!legacy&&!connected&&!lanPending);
-        chat.SetConnected(connected&&!closing);enable(OpenChat,true);enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
+        bool canRequest=!multi||(!server&&activeRows.empty());
+        enable(RequestConnect,canRequest&&!connected&&!lanPending&&consentToken==0);enable(DirectConsent,canRequest&&!connected&&!lanPending&&consentToken==0);enable(ConsentAccept,(multi||!connected)&&consentToken!=0);enable(ConsentReject,consentToken!=0);
+        enable(RegisterPeer,!legacy&&(multi||(!connected&&!lanPending)));enable(ForgetPeer,!legacy&&(multi||(!connected&&!lanPending)));enable(RegistrationKey,!legacy&&(multi||(!connected&&!lanPending)));
+        Chat().SetConnected(connected&&!closing);enable(OpenChat,!multi||!selectedPeer.empty());enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
+        enable(ChangePeerFolder,multi&&server&&connected);enable(ResetPeerFolder,multi&&server&&connected);enable(Pick,!multi||connected);
         enable(Accept,connected&&pendingApproval&&downloadReady);enable(Reject,connected&&pendingApproval);enable(CancelReceive,connected&&incoming!=0);enable(CancelSend,connected&&sendBusy);
     }
     void Create() {
         dpi=GetDpiForWindow(hwnd);
         chat.Create(hwnd,instance);
+        if(multi){Control(Role,L"COMBOBOX",L"",0,0,0,0,CBS_DROPDOWNLIST|WS_VSCROLL);SendMessageW(Get(Role),CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"클라이언트 모드"));SendMessageW(Get(Role),CB_ADDSTRING,0,reinterpret_cast<LPARAM>(L"서버 모드"));SendMessageW(Get(Role),CB_SETCURSEL,0,0);
+            Control(DisplayName,L"EDIT",L"",0,0,0,0,ES_AUTOHSCROLL);SendMessageW(Get(DisplayName),EM_SETLIMITTEXT,96,0);Control(ApplyProfile,L"BUTTON",L"역할/이름 적용",0,0,0,0);
+            Control(LocalInfo,L"STATIC",L"프로필 시작 중",0,0,0,0);Control(SessionCount,L"STATIC",L"연결된 서버 0/1",0,0,0,0);Control(ActiveClients,L"LISTBOX",L"",0,0,0,0,LBS_NOTIFY|WS_VSCROLL|WS_BORDER);Control(PeerInfo,L"STATIC",L"연결된 상대를 선택하세요.",0,0,0,0);
+            Control(PeerFolder,L"STATIC",L"",0,0,0,0,SS_PATHELLIPSIS);Control(ChangePeerFolder,L"BUTTON",L"상대 폴더 변경",0,0,0,0);Control(ResetPeerFolder,L"BUTTON",L"기본 경로 복원",0,0,0,0);}
         Control(LanGroup,L"BUTTON",L"LAN 기기 · 발견된 이름은 인증된 신원이 아닙니다",0,0,0,0,BS_GROUPBOX);
         Control(Devices,L"LISTBOX",L"",0,0,0,0,LBS_NOTIFY|WS_VSCROLL|WS_BORDER);
         Control(RefreshDevices,L"BUTTON",L"새로고침",0,0,0,0);Control(RequestConnect,L"BUTTON",L"선택 기기 연결 요청",0,0,0,0);
@@ -362,50 +484,59 @@ struct Window {
         Control(ChangeFolder,L"BUTTON",L"폴더 변경",0,0,0,0);
         Font();Layout();Buttons();
         DragAcceptFiles(hwnd,TRUE); SetTimer(hwnd,1,50,nullptr);
-        controller=std::make_unique<Controller>(events,legacy);
+        if(multi)multiController=std::make_unique<MultiController>(events);else controller=std::make_unique<Controller>(events,legacy);
         for(int id:{LanGroup,Devices,RefreshDevices,RequestConnect,DirectConsent,ConsentText,ConsentAccept,ConsentReject,LanStatus,RegisterPeer,ForgetPeer,RegistrationKey,TrustInfo})ShowWindow(Get(id),legacy?SW_HIDE:SW_SHOW);
         if(!legacy){for(int id:{Host,Connect,Reconnect})ShowWindow(Get(id),SW_HIDE);}
     }
-    void Select(std::wstring file) {
+    void Select(std::wstring file,uint64_t target=0) {
         path=std::move(file);selectedValid=false;Set(Selected,L"파일 정보 확인 중...");
-        Command c;c.type=Pick;c.path=FileName::ToUtf8(path);c.id=++selection;if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");
+        Command c;c.type=Pick;c.path=FileName::ToUtf8(path);c.id=++selection;c.session=target?target:session;if(!Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");
     }
     void CommandClick(int id) {
         if(closing)return;
+        if(multi&&id==ApplyProfile){
+            bool active=false;for(auto& [peer,v]:views)active|=v.active;
+            if((active||!consents.empty())&&MessageBoxW(hwnd,L"역할/이름 적용 시 모든 연결과 전송을 종료합니다. 부분 전송은 보존됩니다. 계속할까요?",L"프로필 변경",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK){SendMessageW(Get(Role),CB_SETCURSEL,server?1:0,0);return;}
+            Command c;c.type=id;c.id=SendMessageW(Get(Role),CB_GETCURSEL,0,0)==1;c.text=FileName::ToUtf8(Text(Get(DisplayName)));Post(std::move(c));return;
+        }
+        if(multi&&id==ResetPeerFolder){Command c;c.type=id;c.session=session;Post(std::move(c));return;}
         if(id==RegisterPeer||id==ForgetPeer){
-            if(legacy||connected||lanPending)return;
+            if(legacy||(!multi&&(connected||lanPending)))return;
             int selected=static_cast<int>(SendMessageW(Get(Devices),LB_GETCURSEL,0,0));
             if(selected<0||selected>=static_cast<int>(peers.size())){Log(L"등록/해제할 상대 PC를 목록에서 선택하세요.");return;}
-            Command c;c.type=id;c.text=peers[selected].ip;
+            Command c;c.type=id;c.text=peers[selected].ip;if(multi)c.transferId=peers[selected].peerId;
             if(id==RegisterPeer){
                 auto key=FileName::ToUtf8(Text(Get(RegistrationKey)));if(key.empty()){key=TrustedPeers::Generate();Set(RegistrationKey,Wide(key));}
                 if(!TrustedPeers::Hex(key)){Log(L"등록 키는 소문자 0-9, a-f로 된 64자리여야 합니다.");return;}c.path=std::move(key);
             }
-            if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");return;
+            if(!Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");return;
         }
-        if(id==OpenChat){chat.Open();return;}
+        if(id==OpenChat){Chat().Open();auto i=views.find(selectedPeer);if(i!=views.end()){i->second.unread=0;clientsDirty=true;}return;}
         if((id==Accept||id==Reject)&&!legacy)return;
         if(id==SendText&&!connected)return;
         if(id==RequestConnect){
             int selected=static_cast<int>(SendMessageW(Get(Devices),LB_GETCURSEL,0,0));
             if(selected<0||selected>=static_cast<int>(peers.size())){Log(L"연결할 기기를 선택하세요.");return;}
             Command c;c.type=RequestConnect;c.text=peers[selected].ip;c.port=peers[selected].port;c.transferId=peers[selected].id;
-            if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");return;
+            if(multi)c.path=peers[selected].peerId;
+            if(!Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");return;
         }
-        if(id==ConsentAccept||id==ConsentReject){Command c;c.type=id;c.id=consentToken;if(c.id)controller->Post(std::move(c));return;}
-        if(id==ChangeFolder) {
+        if(id==ConsentAccept||id==ConsentReject){Command c;c.type=id;c.id=consentToken;if(c.id)Post(std::move(c));return;}
+        if(id==ChangeFolder||id==ChangePeerFolder) {
+            const auto destinationSession=session;
             IFileOpenDialog* dialog=nullptr;
             if(SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))) {
                 DWORD options=0;dialog->GetOptions(&options);dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST|FOS_NOCHANGEDIR);
                 dialog->SetTitle(L"다운로드 폴더 선택");
-                if(SUCCEEDED(dialog->Show(hwnd))) {IShellItem* item=nullptr;if(SUCCEEDED(dialog->GetResult(&item))){PWSTR path=nullptr;if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&path))){Command c;c.type=ChangeFolder;c.path=FileName::ToUtf8(path);if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");CoTaskMemFree(path);}item->Release();}}
+                if(SUCCEEDED(dialog->Show(hwnd))) {IShellItem* item=nullptr;if(SUCCEEDED(dialog->GetResult(&item))){PWSTR path=nullptr;if(SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH,&path))){Command c;c.type=id;c.session=destinationSession;c.path=FileName::ToUtf8(path);if(!Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");CoTaskMemFree(path);}item->Release();}}
                 dialog->Release();
             }else Log(L"폴더 선택 창을 열 수 없습니다.");return;
         }
         if(id==Pick){
+            const auto destinationSession=session;
             wchar_t buffer[32768]{};OPENFILENAMEW dialog{sizeof(dialog)};dialog.hwndOwner=hwnd;dialog.lpstrFile=buffer;dialog.nMaxFile=32768;
             dialog.lpstrFilter=L"모든 파일\0*.*\0\0";dialog.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST|OFN_NOCHANGEDIR;
-            if(GetOpenFileNameW(&dialog))Select(buffer);return;
+            if(GetOpenFileNameW(&dialog))Select(buffer,destinationSession);return;
         }
         Command c;c.type=id;c.session=session;
         if(id==Host || id==Connect || id==DirectConsent){
@@ -414,15 +545,15 @@ struct Window {
             unsigned long port=std::stoul(portText);if(!port||port>65535){Log(L"포트는 1~65535입니다.");return;}c.port=static_cast<uint16_t>(port);
             c.text=FileName::ToUtf8(Text(Get(Ip)));in_addr address{};
             if((id==Connect||id==DirectConsent) && inet_pton(AF_INET,c.text.c_str(),&address)!=1){Log(L"올바른 IPv4 주소를 입력하세요.");return;}
-        } else if(id==SendText){c.text=FileName::ToUtf8(Text(Get(Message)));if(c.text.empty())return;if(controller->Post(std::move(c)))Set(Message,L"");else Log(L"작업 대기열이 가득 찼습니다.");return;}
+        } else if(id==SendText){c.text=FileName::ToUtf8(Text(Get(Message)));if(c.text.empty())return;if(Post(std::move(c)))Set(Message,L"");else Log(L"작업 대기열이 가득 찼습니다.");return;}
         else if(id==SendFile||id==Resume||id==Query){if(!selectedValid){Log(L"먼저 파일을 선택하세요.");return;}c.path=FileName::ToUtf8(path);c.transferId=FileName::ToUtf8(Text(Get(TransferId)));if(id!=SendFile&&c.transferId.size()!=64){Log(L"원래 전송 ID 64자리를 입력하세요.");return;}}
         else if(id==Accept||id==Reject||id==CancelReceive){c.id=incoming;if(!c.id){Log(L"활성 수신 요청이 없습니다.");return;}}
         else if(id==CancelSend){c.id=outgoing;}
-        if(!controller->Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");
+        if(!Post(std::move(c)))Log(L"작업 대기열이 가득 찼습니다.");
     }
     void Tick() {
         std::wstring textBatch;
-        for(auto& e:events->Drain()) {
+        for(auto& e:FilterEvents(events->Drain())) {
             if(e.kind==AppEvent::Kind::Peers){
                 std::string chosen;int old=static_cast<int>(SendMessageW(Get(Devices),LB_GETCURSEL,0,0));if(old>=0&&old<static_cast<int>(peers.size()))chosen=peers[old].id;
                 peers=std::move(e.peers);SendMessageW(Get(Devices),LB_RESETCONTENT,0,0);
@@ -454,11 +585,13 @@ struct Window {
                 Set(e.sending?SendDetails:ReceiveDetails,(e.sending?sendMetrics:receiveMetrics)+L"\r\n"+Wide(e.name)+L" "+state);Log(state);
                 if(!e.sending){pendingApproval=false;receiveTerminal=e.requestId;incoming=0;Set(Request,L"수신 요청 없음");}
                 else if(e.text.find("Completed")==0||e.text.find("Cancelled")==0||e.text.find("Failed")==0){sendTerminal=e.requestId;outgoing=0;}
-            }            else if(e.kind==AppEvent::Kind::Log){if(e.text.starts_with("Sent: "))chat.Append(L"나: "+Wide(e.text.substr(6)));else Log(Wide(e.text));}
+            }            else if(e.kind==AppEvent::Kind::Log){if(e.text.starts_with("Sent: "))Chat().Append(L"나: "+Wide(e.text.substr(6)));else Log(Wide(e.text));}
         }
-        if(!textBatch.empty())chat.Append(textBatch);
+        if(!textBatch.empty())Chat().Append(textBatch);
+        if(multi&&restoreTransferId){auto i=views.find(selectedPeer);if(i!=views.end()&&!i->second.editedId.empty())Set(TransferId,Wide(i->second.editedId));restoreTransferId=false;}
+        if(multi){for(auto& [id,v]:views)if(v.unread&&GetForegroundWindow()==v.chat->Handle()){v.unread=0;clientsDirty=true;}RefreshClients();}
         Buttons();
-        if(closing && controller->Done()){KillTimer(hwnd,1);DestroyWindow(hwnd);}
+        if(closing && ControllerDone()){KillTimer(hwnd,1);DestroyWindow(hwnd);}
     }
 };
 LRESULT CALLBACK WndProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
@@ -487,17 +620,20 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT message,WPARAM w,LPARAM l) {
         case WM_MOUSEWHEEL:window->scrollY=std::max(0,window->scrollY-MulDiv(GET_WHEEL_DELTA_WPARAM(w),window->Scale(60),WHEEL_DELTA));window->Layout();return 0;
         case WM_GETMINMAXINFO:{auto* limits=reinterpret_cast<MINMAXINFO*>(l);limits->ptMinTrackSize={window->Scale(850),window->Scale(450)};return 0;}
         case WM_DPICHANGED:{window->scrollY=MulDiv(window->scrollY,HIWORD(w),window->dpi);window->dpi=HIWORD(w);window->Font();auto* r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);window->Layout();return 0;}
-        case WM_COMMAND:if(HIWORD(w)==BN_CLICKED)window->CommandClick(LOWORD(w));return 0;
+        case WM_COMMAND:
+            if(window->multi&&LOWORD(w)==ActiveClients&&HIWORD(w)==LBN_SELCHANGE){int row=static_cast<int>(SendMessageW(window->Get(ActiveClients),LB_GETCURSEL,0,0));if(row>=0&&row<static_cast<int>(window->activeRows.size()))window->ChoosePeer(window->activeRows[row]);return 0;}
+            if(LOWORD(w)==SendText&&l){window->ChatSend(reinterpret_cast<HWND>(l));return 0;}
+            if(HIWORD(w)==BN_CLICKED)window->CommandClick(LOWORD(w));return 0;
         case WM_TIMER:window->Tick();return 0;
         case WM_DROPFILES:{HDROP drop=reinterpret_cast<HDROP>(w);struct DropOwner{HDROP value;~DropOwner(){DragFinish(value);}} owner{drop};if(DragQueryFileW(drop,0xffffffff,nullptr,0)==1&&!window->closing){UINT size=DragQueryFileW(drop,0,nullptr,0);if(size>32768){window->Log(L"파일 경로가 너무 깁니다.");return 0;}std::wstring path(size+1,L'\0');DragQueryFileW(drop,0,path.data(),size+1);path.resize(size);window->Select(std::move(path));}else window->Log(L"한 번에 파일 하나를 놓으세요.");return 0;}
-        case WM_CLOSE:if(!window->closing){window->closing=true;window->controller->Close();window->Set(Status,L"종료 중 — 작업 정리 대기");}return 0;
+        case WM_CLOSE:if(!window->closing){window->closing=true;window->CloseController();window->Set(Status,L"종료 중 — 작업 정리 대기");}return 0;
         case WM_DESTROY:PostQuitMessage(0);return 0;
         }
     }catch(const std::exception&){if(message==WM_CREATE)return -1;window->Log(L"입력을 처리할 수 없습니다.");return 0;}
     return DefWindowProcW(hwnd,message,w,l);
 }
 }
-int RunGui(HINSTANCE instance,int show,bool legacy) {
+int RunGui(HINSTANCE instance,int show,bool legacy,bool compatibility) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
     struct ComOwner {HRESULT hr;~ComOwner(){if(SUCCEEDED(hr))CoUninitialize();}} comOwner{com};
@@ -505,12 +641,12 @@ int RunGui(HINSTANCE instance,int show,bool legacy) {
     WNDCLASSEXW klass{sizeof(klass)};klass.hInstance=instance;klass.lpfnWndProc=WndProc;klass.lpszClassName=L"FileTransferAppGui";
     klass.hCursor=LoadCursorW(nullptr,IDC_ARROW);klass.hbrBackground=reinterpret_cast<HBRUSH>(COLOR_BTNFACE+1);
     if(!RegisterClassExW(&klass))return 1;
-    Window window;window.instance=instance;window.legacy=legacy;window.dpi=GetDpiForSystem();
+    Window window;window.instance=instance;window.legacy=legacy;window.multi=!legacy&&!compatibility;window.dpi=GetDpiForSystem();
     RECT desktop{};SystemParametersInfoW(SPI_GETWORKAREA,0,&desktop,0);
     HWND hwnd=CreateWindowExW(0,klass.lpszClassName,L"FileTransferApp v" FTA_VERSION_W L" — LAN 파일 전송",WS_OVERLAPPEDWINDOW|WS_VSCROLL,
         CW_USEDEFAULT,CW_USEDEFAULT,std::min(window.Scale(900),static_cast<int>(desktop.right-desktop.left)),std::min(window.Scale(850),static_cast<int>(desktop.bottom-desktop.top)),nullptr,nullptr,instance,&window);
     if(!hwnd)return 1;
     ShowWindow(hwnd,show);UpdateWindow(hwnd);
-    MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){HWND root=GetAncestor(msg.hwnd,GA_ROOT);HWND target=root==window.chat.Handle()?root:hwnd;if(!IsDialogMessageW(target,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
+    MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){HWND root=GetAncestor(msg.hwnd,GA_ROOT);wchar_t klass[64]{};GetClassNameW(root,klass,64);HWND target=std::wstring_view(klass)==L"FileTransferAppChat"?root:hwnd;if(!IsDialogMessageW(target,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
     return 0;
 }

@@ -19,7 +19,7 @@ void ChatWindow::Create(HWND owner,HINSTANCE instance){
         CW_USEDEFAULT,CW_USEDEFAULT,Scale(650),Scale(520),owner,nullptr,instance,this))throw std::runtime_error("Cannot create chat window");
 }
 void ChatWindow::Open(){ShowWindow(hwnd_,IsIconic(hwnd_)?SW_RESTORE:SW_SHOW);SetForegroundWindow(hwnd_);SetFocus(Control(Message));}
-void ChatWindow::SetConnected(bool connected){if(stateSet_&&connected_==connected)return;connected_=connected;stateSet_=true;EnableWindow(Control(SendText),connected);SetWindowTextW(hwnd_,connected?L"FileTransferApp — 대화 (연결됨)":L"FileTransferApp — 대화 (연결되지 않음)");}
+void ChatWindow::SetConnected(bool connected){if(stateSet_&&connected_==connected)return;connected_=connected;stateSet_=true;EnableWindow(Control(SendText),connected);auto title=(peerName_.empty()?L"FileTransferApp":peerName_)+std::wstring(connected?L" — 대화 (연결됨)":L" — 대화 (연결되지 않음)");SetWindowTextW(hwnd_,title.c_str());}
 void ChatWindow::Append(const std::wstring& value){
     HWND edit=Control(Transcript);
     if(GetWindowTextLengthW(edit)>60000){SendMessageW(edit,EM_SETSEL,0,20000);SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(L""));}
@@ -55,7 +55,7 @@ LRESULT CALLBACK ChatWindow::EditProc(HWND edit,UINT msg,WPARAM w,LPARAM l,UINT_
     if(msg==WM_KEYDOWN && w==VK_RETURN){
         // WM_CHAR can arrive after Shift-up. Use the modifier state at key-down.
         chat->suppressReturnChar_=!chat->composing_ && !(GetKeyState(VK_SHIFT)&0x8000);
-        if(chat->suppressReturnChar_){SendMessageW(chat->owner_,WM_COMMAND,SendText,0);return 0;}
+        if(chat->suppressReturnChar_){SendMessageW(chat->owner_,WM_COMMAND,SendText,reinterpret_cast<LPARAM>(chat->hwnd_));return 0;}
     }
     if(msg==WM_CHAR && w==L'\r' && chat->suppressReturnChar_)return 0;
     return DefSubclassProc(edit,msg,w,l);
@@ -79,7 +79,7 @@ LRESULT CALLBACK ChatWindow::Proc(HWND hwnd,UINT msg,WPARAM w,LPARAM l){
     case WM_SIZE:if(w!=SIZE_MINIMIZED)chat->Layout();return 0;
     case WM_GETMINMAXINFO:{auto* info=reinterpret_cast<MINMAXINFO*>(l);info->ptMinTrackSize={chat->Scale(420),chat->Scale(300)};return 0;}
     case WM_DPICHANGED:{chat->dpi_=HIWORD(w);chat->Font();auto* r=reinterpret_cast<RECT*>(l);SetWindowPos(hwnd,nullptr,r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOZORDER|SWP_NOACTIVATE);chat->Layout();return 0;}
-    case WM_COMMAND:if(LOWORD(w)==SendText&&HIWORD(w)==BN_CLICKED)SendMessageW(chat->owner_,WM_COMMAND,SendText,0);return 0;
+    case WM_COMMAND:if(LOWORD(w)==SendText&&HIWORD(w)==BN_CLICKED)SendMessageW(chat->owner_,WM_COMMAND,SendText,reinterpret_cast<LPARAM>(hwnd));return 0;
     case WM_CLOSE:ShowWindow(hwnd,SW_HIDE);return 0;
     case WM_DESTROY:chat->hwnd_=nullptr;return 0;
     }
