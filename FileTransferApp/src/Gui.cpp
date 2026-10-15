@@ -3,6 +3,7 @@
 #include "Gui.h"
 #include "AppVersion.h"
 #include "GuiSettings.h"
+#include "ChatWindow.h"
 #include "LanService.h"
 #include "FileName.h"
 #include <commctrl.h>
@@ -22,7 +23,7 @@ namespace {
 enum Id { Ip=101, Port, Host, Connect, Disconnect, Reconnect, Status, Transcript,
     Message, SendText, Pick, Selected, SendFile, DropSelect, Request, Accept, Reject,
     CancelSend, CancelReceive, SendProgress, ReceiveProgress, SendDetails, ReceiveDetails,
-    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus };
+    TransferId, Resume, Query, DownloadPath, ChangeFolder, ConnectionGroup, MessageGroup, FileGroup, ProgressGroup, LanGroup, Devices, RefreshDevices, RequestConnect, DirectConsent, ConsentText, ConsentAccept, ConsentReject, LanStatus, OpenChat, ActivityLog, AutoInfo };
 struct Command {
     int type = 0; std::string text, path, transferId;
     uint64_t id = 0, session = 0; uint16_t port = 9000;
@@ -47,9 +48,12 @@ private:
     std::atomic<bool> endingSession_{false};
     std::unique_ptr<Network> network_;
     std::thread receiver_, sender_, action_;
+    std::thread preparation_;
+    std::atomic<bool> preparing_{false};
     uint64_t session_ = 0;
     Command endpoint_;
     std::filesystem::path downloadFolder_;
+    std::deque<Command> textQueue_; // Manager-thread-only; preserves chat order.
     bool legacy_=false;
     std::unique_ptr<LanService> lan_;
     std::atomic<bool> legacyRunning_{false};
@@ -72,9 +76,11 @@ private:
         if (network_) network_->RequestStop();
         if (sender_.joinable()) sender_.join();
         if (action_.joinable()) action_.join();
+        if (preparation_.joinable()) preparation_.join();
         if (receiver_.joinable()) receiver_.join();
         if (network_) network_->Disconnect();
-        network_.reset(); sending_ = acting_ = false;
+        network_.reset(); sending_ = acting_ = preparing_ = false;
+        textQueue_.clear();
     }
     void Begin(const Command& command) {
         EndSession(); endpoint_ = command; ++session_;
@@ -127,6 +133,30 @@ private:
     void DownloadEvent() {
         AppEvent e;e.kind=AppEvent::Kind::Download;e.text=FileName::ToUtf8(downloadFolder_.wstring());events_->Push(std::move(e));
     }
+    void AutoReceive() {
+        if(legacy_ || preparing_ || !network_ || !network_->IsConnected())return;
+        const auto id=network_->PendingFileRequestId();
+        if(!id)return;
+        if(preparation_.joinable())preparation_.join();
+        // Snapshot the destination on the manager thread. Folder changes apply
+        // to the next request, never to an already prepared receive.
+        auto folder=downloadFolder_;
+        preparing_=true;
+        preparation_=std::thread([this,id,folder=std::move(folder)] {
+            try {
+                if(folder.empty()){
+                    network_->RejectFile(id);
+                    Emit(AppEvent::Kind::Log,"Automatic receive refused: choose a valid download folder.");
+                }else if(!network_->AcceptFile(id,folder)){
+                    Emit(AppEvent::Kind::Log,"Automatic receive preparation ended: request cancelled, expired or disconnected.");
+                }
+            }catch(const std::exception& e){
+                network_->RejectFile(id);
+                Emit(AppEvent::Kind::Log,std::string("Automatic receive failed: ")+e.what());
+            }
+            preparing_=false;
+        });
+    }
     void Process(Command c) {
         if(c.type==RefreshDevices){if(lan_)lan_->Refresh();return;}
         if(c.type==ConsentAccept||c.type==ConsentReject){if(lan_)lan_->Decide(c.id,c.type==ConsentAccept);return;}
@@ -162,7 +192,8 @@ private:
             if(c.type==CancelSend){preparationCancelled_=true;c.id=network_->OutgoingRequestId();}
             if (!c.id || !network_->CancelFile(c.id)) Emit(AppEvent::Kind::Log,"No matching active transfer to cancel.");
         } else if (c.type == SendFile || c.type == Resume || c.type == Query) File(std::move(c));
-        else { if(c.type==Accept){ if(downloadFolder_.empty()){Emit(AppEvent::Kind::Log,"Choose a valid download folder first.");return;} c.path=FileName::ToUtf8(downloadFolder_.wstring()); } Action(std::move(c)); }
+        else if(c.type==SendText){if(textQueue_.size()<64)textQueue_.push_back(std::move(c));else Emit(AppEvent::Kind::Log,"Message queue full; text was not sent.");}
+        else { if((c.type==Accept||c.type==Reject)&&!legacy_)return; if(c.type==Accept){ if(downloadFolder_.empty()){Emit(AppEvent::Kind::Log,"Choose a valid download folder first.");return;} c.path=FileName::ToUtf8(downloadFolder_.wstring()); } Action(std::move(c)); }
     }
     void Loop() {
         try {
@@ -172,7 +203,7 @@ private:
             if(!legacy_){try{lan_=std::make_unique<LanService>(events_);}catch(const std::exception& e){Emit(AppEvent::Kind::LanStatus,std::string("LAN unavailable: ")+e.what());}}
             while (!stop_) {
                 if(lan_){
-                    lan_->Poll((network_&&network_->IsConnected())||legacyRunning_||sending_||acting_);
+                    lan_->Poll((network_&&network_->IsConnected())||legacyRunning_||sending_||acting_||preparing_);
                     if(auto approved=lan_->TakeApproved()){lan_->Cancel();if(stop_)closesocket(approved->socket);else Adopt(*approved);}
                 }
                 Command c; bool found=false;
@@ -183,6 +214,12 @@ private:
                     if (!commands_.empty()) { c=std::move(commands_.front()); commands_.pop_front(); found=true; }
                 }
                 if (found) Process(std::move(c));
+                if(!acting_&&!textQueue_.empty()){
+                    auto message=std::move(textQueue_.front());textQueue_.pop_front();
+                    if(network_&&network_->IsConnected()&&message.session==session_)Action(std::move(message));
+                    else Emit(AppEvent::Kind::Log,"Queued message discarded after disconnect.");
+                }
+                AutoReceive();
             }
         } catch (const std::exception& e) { Emit(AppEvent::Kind::Log,std::string("Session error: ")+e.what()); }
         lan_.reset();EndSession(); done_=true;
@@ -201,17 +238,18 @@ struct Window {
     std::vector<DiscoveredPeer> peers; uint64_t consentToken=0;
     std::shared_ptr<EventQueue> events=std::make_shared<EventQueue>();
     std::unique_ptr<Controller> controller;
+    ChatWindow chat;
     uint64_t session=0, incoming=0, outgoing=0;
     uint64_t selection=0, sendTerminal=0, receiveTerminal=0;
     bool closing=false, selectedValid=false, connected=false, connecting=false, sendBusy=false, pendingApproval=false;
     UINT dpi=96; HFONT font=nullptr; int scrollY=0; bool downloadReady=false, lanPending=false;
     std::wstring path;
     std::wstring sendMetrics, receiveMetrics, sendState, receiveState;
-    HWND Get(int id) { return GetDlgItem(hwnd,id); }
+    HWND Get(int id) { return id==Transcript||id==Message||id==SendText ? chat.Control(id) : GetDlgItem(hwnd,id); }
     void Set(int id,const std::wstring& text) { SetWindowTextW(Get(id),text.c_str()); }
     void Log(std::wstring text) {
         text += L"\r\n";
-        auto edit=Get(Transcript);
+        auto edit=Get(ActivityLog);
         if (GetWindowTextLengthW(edit)>60000) { SendMessageW(edit,EM_SETSEL,0,20000); SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(L"")); }
         SendMessageW(edit,EM_SETSEL,-1,-1); SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(text.c_str()));
     }
@@ -219,12 +257,6 @@ struct Window {
         HWND control=CreateWindowExW(type==std::wstring_view(L"EDIT")?WS_EX_CLIENTEDGE:0,type,text,
             WS_CHILD|WS_VISIBLE|WS_TABSTOP|extra,x,y,w,h,hwnd,reinterpret_cast<HMENU>(INT_PTR(id)),instance,nullptr);
         SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)),TRUE);
-    }
-    static LRESULT CALLBACK EditProc(HWND edit,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR) {
-        if(msg==WM_GETDLGCODE && l && reinterpret_cast<MSG*>(l)->wParam==VK_RETURN)
-            return DefSubclassProc(edit,msg,w,l)|DLGC_WANTMESSAGE;
-        if(msg==WM_KEYDOWN && w==VK_RETURN){SendMessageW(GetParent(edit),WM_COMMAND,SendText,0);return 0;}
-        return DefSubclassProc(edit,msg,w,l);
     }
     ~Window(){controller.reset();if(font)DeleteObject(font);}
     int Scale(int n) const {return MulDiv(n,dpi,96);}
@@ -238,7 +270,7 @@ struct Window {
         const int extra=std::max(0,h-795),width=w-40;
         HRGN dirty=CreateRectRgn(0,0,0,0);
         auto place=[&](int id,int x,int y,int cw,int ch){
-            HWND child=Get(id);RECT before{};GetWindowRect(child,&before);
+            HWND child=Get(id);if(!child)return;RECT before{};GetWindowRect(child,&before);
             MapWindowPoints(HWND_DESKTOP,hwnd,reinterpret_cast<POINT*>(&before),2);
             RECT after{Scale(x),Scale(y)-scrollY,Scale(x)+Scale(cw),Scale(y)-scrollY+Scale(ch)};
             if(EqualRect(&before,&after))return;
@@ -258,9 +290,9 @@ struct Window {
         }
         move(ConnectionGroup,10,5,w-20,93);move(Ip,25,29,170,27);move(Port,205,29,65,27);
         move(Host,280,29,100,29);move(Connect,390,29,75,29);move(Disconnect,475,29,100,29);move(Reconnect,585,29,90,29);move(Status,25,65,width,24);
-        move(MessageGroup,10,105,w-20,225+extra);move(Transcript,25,128,width,155+extra);move(Message,25,291+extra,w-175,28);move(SendText,w-140,291+extra,115,28);
+        move(MessageGroup,10,105,w-20,225+extra);move(ActivityLog,25,128,width,155+extra);move(OpenChat,25,291+extra,160,28);move(AutoInfo,200,291+extra,w-225,28);
         int f=340+extra;move(FileGroup,10,f,w-20,188);move(Pick,25,f+25,105,29);move(SendFile,140,f+25,115,29);
-        move(Selected,25,f+61,width,35);move(Request,25,f+101,w-245,36);move(Accept,w-210,f+100,85,29);move(Reject,w-115,f+100,85,29);
+        move(Selected,25,f+61,width,35);move(Request,25,f+101,legacy?w-245:width,36);move(Accept,w-210,f+100,85,29);move(Reject,w-115,f+100,85,29);
         move(DownloadPath,25,f+145,w-175,35);move(ChangeFolder,w-140,f+143,115,29);
         int p=538+extra;move(ProgressGroup,10,p,w-20,247);move(CancelSend,25,p+25,105,29);move(CancelReceive,140,p+25,105,29);
         move(SendProgress,25,p+64,width,18);move(SendDetails,25,p+86,width,43);move(ReceiveProgress,25,p+132,width,18);move(ReceiveDetails,25,p+154,width,43);
@@ -279,11 +311,12 @@ struct Window {
         auto enable=[&](int id,bool on){EnableWindow(Get(id),on&&!closing);};
         enable(Host,legacy&&!connected&&!connecting);enable(Connect,legacy&&!connected&&!connecting);enable(Disconnect,connected||connecting||lanPending);enable(Reconnect,legacy&&!connected&&!connecting);
         enable(RequestConnect,!connected&&!lanPending&&consentToken==0);enable(DirectConsent,!connected&&!lanPending&&consentToken==0);enable(ConsentAccept,!connected&&consentToken!=0);enable(ConsentReject,consentToken!=0);
-        enable(SendText,connected);enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
+        chat.SetConnected(connected&&!closing);enable(OpenChat,true);enable(SendFile,connected&&selectedValid&&!sendBusy);enable(Resume,connected&&selectedValid&&!sendBusy);enable(Query,connected&&selectedValid&&!sendBusy);
         enable(Accept,connected&&pendingApproval&&downloadReady);enable(Reject,connected&&pendingApproval);enable(CancelReceive,connected&&incoming!=0);enable(CancelSend,connected&&sendBusy);
     }
     void Create() {
         dpi=GetDpiForWindow(hwnd);
+        chat.Create(hwnd,instance);
         Control(LanGroup,L"BUTTON",L"LAN 기기 · 발견된 이름은 인증된 신원이 아닙니다",0,0,0,0,BS_GROUPBOX);
         Control(Devices,L"LISTBOX",L"",0,0,0,0,LBS_NOTIFY|WS_VSCROLL|WS_BORDER);
         Control(RefreshDevices,L"BUTTON",L"새로고침",0,0,0,0);Control(RequestConnect,L"BUTTON",L"선택 기기 연결 요청",0,0,0,0);
@@ -292,7 +325,7 @@ struct Window {
         Control(ConsentAccept,L"BUTTON",L"연결 승인",0,0,0,0);Control(ConsentReject,L"BUTTON",L"연결 거절",0,0,0,0);
         Control(LanStatus,L"STATIC",L"LAN 시작 중",0,0,0,0);
         Control(ConnectionGroup,L"BUTTON",L"연결 · IPv4 / 포트",0,0,0,0,BS_GROUPBOX);
-        Control(MessageGroup,L"BUTTON",L"메시지",0,0,0,0,BS_GROUPBOX);
+        Control(MessageGroup,L"BUTTON",L"작업 기록 · 대화는 별도 창에서",0,0,0,0,BS_GROUPBOX);
         Control(FileGroup,L"BUTTON",L"파일 전송 · 한 번에 파일 하나",0,0,0,0,BS_GROUPBOX);
         Control(ProgressGroup,L"BUTTON",L"진행 상태 · 저장 ACK 확인 후 송신 성공",0,0,0,0,BS_GROUPBOX);
         Control(Ip,L"EDIT",L"127.0.0.1",15,15,170,25);
@@ -301,14 +334,14 @@ struct Window {
         Control(Host,L"BUTTON",L"연결 대기",275,15,95,27); Control(Connect,L"BUTTON",L"연결",380,15,75,27);
         Control(Disconnect,L"BUTTON",L"연결 해제",465,15,95,27); Control(Reconnect,L"BUTTON",L"재접속",570,15,85,27);
         Control(Status,L"STATIC",L"연결 안 됨",15,50,800,25);
-        Control(Transcript,L"EDIT",L"",15,80,800,210,ES_MULTILINE|ES_READONLY|WS_VSCROLL|ES_AUTOVSCROLL);
-        SendMessageW(Get(Transcript),EM_SETLIMITTEXT,80000,0);
-        Control(Message,L"EDIT",L"",15,300,680,27,ES_AUTOHSCROLL); Control(SendText,L"BUTTON",L"메시지 전송",705,300,110,27);
-        SendMessageW(Get(Message),EM_SETLIMITTEXT,4096,0);SetWindowSubclass(Get(Message),EditProc,1,0);
+        Control(ActivityLog,L"EDIT",L"",15,80,800,210,ES_MULTILINE|ES_READONLY|WS_VSCROLL|ES_AUTOVSCROLL);
+        SendMessageW(Get(ActivityLog),EM_SETLIMITTEXT,80000,0);
+        Control(OpenChat,L"BUTTON",L"대화 창 열기",0,0,0,0);
+        Control(AutoInfo,L"STATIC",legacy?L"CLI 진단 모드: 파일 수신 수동 승인":L"연결 승인 후 파일을 다운로드 폴더로 자동 수신",0,0,0,0);
         Control(Pick,L"BUTTON",L"파일 선택",15,345,100,28); Control(SendFile,L"BUTTON",L"파일 보내기",125,345,110,28);
         Control(Selected,L"STATIC",L"파일을 선택하거나 하나의 파일을 창에 놓으세요.",15,380,800,38);
         Control(Request,L"STATIC",L"수신 요청 없음",15,425,600,35);
-        Control(Accept,L"BUTTON",L"승인",625,425,85,28); Control(Reject,L"BUTTON",L"거절",720,425,85,28);
+        if(legacy){Control(Accept,L"BUTTON",L"승인",625,425,85,28); Control(Reject,L"BUTTON",L"거절",720,425,85,28);}
         Control(CancelSend,L"BUTTON",L"송신 취소",15,470,100,28);Control(CancelReceive,L"BUTTON",L"수신 취소",125,470,100,28);
         Control(SendProgress,PROGRESS_CLASSW,L"",15,510,800,20);Control(SendDetails,L"STATIC",L"송신 대기",15,535,800,40);
         Control(ReceiveProgress,PROGRESS_CLASSW,L"",15,580,800,20);Control(ReceiveDetails,L"STATIC",L"수신 대기",15,605,800,40);
@@ -329,6 +362,9 @@ struct Window {
     }
     void CommandClick(int id) {
         if(closing)return;
+        if(id==OpenChat){chat.Open();return;}
+        if((id==Accept||id==Reject)&&!legacy)return;
+        if(id==SendText&&!connected)return;
         if(id==RequestConnect){
             int selected=static_cast<int>(SendMessageW(Get(Devices),LB_GETCURSEL,0,0));
             if(selected<0||selected>=static_cast<int>(peers.size())){Log(L"연결할 기기를 선택하세요.");return;}
@@ -357,7 +393,7 @@ struct Window {
             unsigned long port=std::stoul(portText);if(!port||port>65535){Log(L"포트는 1~65535입니다.");return;}c.port=static_cast<uint16_t>(port);
             c.text=FileName::ToUtf8(Text(Get(Ip)));in_addr address{};
             if((id==Connect||id==DirectConsent) && inet_pton(AF_INET,c.text.c_str(),&address)!=1){Log(L"올바른 IPv4 주소를 입력하세요.");return;}
-        } else if(id==SendText){c.text=FileName::ToUtf8(Text(Get(Message)));if(c.text.empty())return;Set(Message,L"");}
+        } else if(id==SendText){c.text=FileName::ToUtf8(Text(Get(Message)));if(c.text.empty())return;if(controller->Post(std::move(c)))Set(Message,L"");else Log(L"작업 대기열이 가득 찼습니다.");return;}
         else if(id==SendFile||id==Resume||id==Query){if(!selectedValid){Log(L"먼저 파일을 선택하세요.");return;}c.path=FileName::ToUtf8(path);c.transferId=FileName::ToUtf8(Text(Get(TransferId)));if(id!=SendFile&&c.transferId.size()!=64){Log(L"원래 전송 ID 64자리를 입력하세요.");return;}}
         else if(id==Accept||id==Reject||id==CancelReceive){c.id=incoming;if(!c.id){Log(L"활성 수신 요청이 없습니다.");return;}}
         else if(id==CancelSend){c.id=outgoing;}
@@ -372,14 +408,14 @@ struct Window {
                 for(size_t i=0;i<peers.size();++i){auto& p=peers[i];auto line=Wide(p.name)+L"  |  "+Wide(p.ip)+L":"+std::to_wstring(p.port)+L"  |  발견 (미인증) ["+Wide(p.id.substr(0,8))+L"]";SendMessageW(Get(Devices),LB_ADDSTRING,0,reinterpret_cast<LPARAM>(line.c_str()));if(p.id==chosen)SendMessageW(Get(Devices),LB_SETCURSEL,i,0);}
                 continue;
             }
-            if(e.kind==AppEvent::Kind::Consent){consentToken=e.requestId;if(consentToken)lanPending=true;Set(ConsentText,e.text.empty()?L"연결 요청 없음":L"연결 요청: "+Wide(e.text));continue;}
+            if(e.kind==AppEvent::Kind::Consent){consentToken=e.requestId;if(consentToken)lanPending=true;Set(ConsentText,e.text.empty()?L"연결 요청 없음":L"연결 요청 (승인 후 파일 자동 수신): "+Wide(e.text));continue;}
             if(e.kind==AppEvent::Kind::LanStatus){lanPending=e.total!=0;Set(LanStatus,Wide(e.text));Log(Wide(e.text));continue;}
             if(e.kind==AppEvent::Kind::Download){downloadReady=!e.text.empty();Set(DownloadPath,downloadReady?Wide(e.text):L"저장 폴더를 선택하세요 (설정 오류)");continue;}
             if(e.kind==AppEvent::Kind::Selection){if(e.requestId!=selection)continue;path=Wide(e.text);selectedValid=true;Set(Selected,Wide(e.name)+L" — "+std::to_wstring(e.total)+L" bytes");continue;}
             if(e.kind==AppEvent::Kind::Connection && e.session>=session){if(e.session!=session||e.text=="Disconnected"){incoming=outgoing=0;sendTerminal=receiveTerminal=0;Set(Request,L"수신 요청 없음");}session=e.session;connected=e.text.starts_with("Connected:");if(connected||e.text=="Disconnected")lanPending=false;connecting=e.text=="Waiting for peer"||e.text=="Connecting";if(!connected){sendBusy=false;pendingApproval=false;}Set(Status,Wide(e.text));Log(Wide(e.text));}
             else if(e.session!=session)continue;
             else if(e.kind==AppEvent::Kind::Text){textBatch+=L"상대: "+Wide(e.text)+L"\r\n";if(textBatch.size()>32000){textBatch.erase(0,textBatch.size()-32000);if(!textBatch.empty()&&textBatch.front()>=0xdc00&&textBatch.front()<=0xdfff)textBatch.erase(0,1);}}
-            else if(e.kind==AppEvent::Kind::Request){incoming=e.requestId;pendingApproval=true;receiveTerminal=0;receiveMetrics.clear();receiveState.clear();Set(Request,Wide(e.name)+L" / "+std::to_wstring(e.total)+L" bytes / requestId="+std::to_wstring(incoming));Log(L"수신 요청: "+Wide(e.name));}
+            else if(e.kind==AppEvent::Kind::Request){incoming=e.requestId;pendingApproval=legacy;receiveTerminal=0;receiveMetrics.clear();receiveState.clear();Set(Request,(legacy?L"수신 요청: ":L"자동 수신 준비: ")+Wide(e.name)+L" / "+std::to_wstring(e.total)+L" bytes / requestId="+std::to_wstring(incoming));Log((legacy?L"수신 요청: ":L"자동 수신 준비: ")+Wide(e.name));}
             else if(e.kind==AppEvent::Kind::Identity){outgoing=e.requestId;sendTerminal=0;sendMetrics.clear();sendState.clear();Set(TransferId,Wide(e.transferId));Log(L"전송 ID: "+Wide(e.transferId));}
             else if(e.kind==AppEvent::Kind::Progress){
                 auto& p=e.progress;if(!p.sending)pendingApproval=false;std::wostringstream text;
@@ -397,9 +433,9 @@ struct Window {
                 Set(e.sending?SendDetails:ReceiveDetails,(e.sending?sendMetrics:receiveMetrics)+L"\r\n"+Wide(e.name)+L" "+state);Log(state);
                 if(!e.sending){pendingApproval=false;receiveTerminal=e.requestId;incoming=0;Set(Request,L"수신 요청 없음");}
                 else if(e.text.find("Completed")==0||e.text.find("Cancelled")==0||e.text.find("Failed")==0){sendTerminal=e.requestId;outgoing=0;}
-            }            else if(e.kind==AppEvent::Kind::Log)Log(Wide(e.text));
+            }            else if(e.kind==AppEvent::Kind::Log){if(e.text.starts_with("Sent: "))chat.Append(L"나: "+Wide(e.text.substr(6)));else Log(Wide(e.text));}
         }
-        if(!textBatch.empty())Log(std::move(textBatch));
+        if(!textBatch.empty())chat.Append(textBatch);
         Buttons();
         if(closing && controller->Done()){KillTimer(hwnd,1);DestroyWindow(hwnd);}
     }
@@ -454,6 +490,6 @@ int RunGui(HINSTANCE instance,int show,bool legacy) {
         CW_USEDEFAULT,CW_USEDEFAULT,std::min(window.Scale(900),static_cast<int>(desktop.right-desktop.left)),std::min(window.Scale(850),static_cast<int>(desktop.bottom-desktop.top)),nullptr,nullptr,instance,&window);
     if(!hwnd)return 1;
     ShowWindow(hwnd,show);UpdateWindow(hwnd);
-    MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){if(!IsDialogMessageW(hwnd,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
+    MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){HWND root=GetAncestor(msg.hwnd,GA_ROOT);HWND target=root==window.chat.Handle()?root:hwnd;if(!IsDialogMessageW(target,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}}
     return 0;
 }

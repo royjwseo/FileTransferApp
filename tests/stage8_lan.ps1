@@ -28,8 +28,8 @@ try {
     Connect-Pair $a $b;Assert ($a.G.Enabled(110) -and $b.G.Enabled(110)) 'Approved session controls not enabled';Pass 'explicit incoming consent hands approved socket to existing TCP protocol'
     $a.G.Click(136);$a.G.Wait(108,'already connected or busy');Assert ($b.G.Text(138) -eq '연결 요청 없음') 'Duplicate incoming session';Pass 'duplicate connection request blocked while session active'
     $a.G.Set(109,'LAN 한글 메시지');$a.G.Click(110);$b.G.Wait(108,'LAN 한글 메시지');$b.G.Set(109,'LAN reply');$b.G.Enter();$a.G.Wait(108,'LAN reply');Pass 'approved connection supports bidirectional Unicode text'
-    $source=Join-Path $runDir 'LAN 사진.pdf';[IO.File]::WriteAllBytes($source,[byte[]](1..255));$a.G.Pick($source);$a.G.Click(113);$b.G.Wait(115,'LAN 사진.pdf');$b.G.Click(116);$a.G.Wait(122,'Completed:');
-    Assert ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath (Join-Path $b.Dir 'received/LAN 사진.pdf')).Hash) 'Approved transfer hash mismatch';Pass 'approved connection retains file approval, stored ACK and SHA-256'
+    $source=Join-Path $runDir 'LAN 사진.pdf';[IO.File]::WriteAllBytes($source,[byte[]](1..255));$a.G.Pick($source);$a.G.Click(113);$a.G.Wait(122,'Completed:');$b.G.Wait(123,'Saved:');
+    Assert ((Get-FileHash -LiteralPath $source).Hash -eq (Get-FileHash -LiteralPath (Join-Path $b.Dir 'received/LAN 사진.pdf')).Hash) 'Automatic transfer hash mismatch';Pass 'approved connection automatically receives file with stored ACK and SHA-256'
     Disconnect $a $b;$a.G.Click(135);Wait-Devices $a 1;Connect-Pair $a $b;Disconnect $a $b;Pass 'disconnect retains discovery and permits new user-approved connection'
     $a.G.Set(101,'127.0.0.1');$a.G.Set(102,[string]$b.Port);$a.G.Click(137);$b.G.Wait(138,'unverified');$b.G.Click(139);$a.G.Wait(107,'Connected:');$b.G.Wait(107,'Connected:');Disconnect $a $b;Pass 'direct IPv4 request uses the same consent gate'
     Select-Peer $a $b;Select-Peer $b $a;$a.G.Click(136);$b.G.Click(136)

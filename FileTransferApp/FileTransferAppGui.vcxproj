@@ -22,6 +22,7 @@
     <ClInclude Include="include\FileTransfer.h" />
     <ClInclude Include="include\Events.h" />
     <ClInclude Include="include\Gui.h" />
+    <ClInclude Include="include\ChatWindow.h" />
     <ClInclude Include="include\LanService.h" />
     <ClInclude Include="include\GuiSettings.h" />
     <ClInclude Include="include\FileName.h" />
@@ -33,6 +34,7 @@
     <ClCompile Include="src\FileTransfer.cpp" />
     <ClCompile Include="src\GuiMain.cpp" />
     <ClCompile Include="src\Gui.cpp" />
+    <ClCompile Include="src\ChatWindow.cpp" />
     <ClCompile Include="src\LanService.cpp" />
     <ClCompile Include="src\Network.cpp" />
     <ClCompile Include="src\Protocol.cpp" />

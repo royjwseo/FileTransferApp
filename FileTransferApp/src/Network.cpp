@@ -547,6 +547,13 @@ bool Network::SendReplies(std::vector<Protocol::Reply> replies)
     return true;
 }
 
+uint64_t Network::PendingFileRequestId()
+{
+    std::lock_guard<std::mutex> lock(protocolMutex_);
+    Protocol::IncomingFileRequest request;
+    return protocol_.TakeFileRequest(request) ? request.requestId : 0;
+}
+
 bool Network::AcceptFile(uint64_t expectedRequestId, const std::filesystem::path& folder)
 {
     Protocol::IncomingFileRequest request;

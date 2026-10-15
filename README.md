@@ -4,11 +4,18 @@ Windows에서 같은 LAN의 PC끼리 파일과 텍스트를 주고받는 프로�
 
 일반 사용자는 **FileTransferAppGui.exe**를 실행하세요. **FileTransferApp.exe**는 콘솔 사용·진단·자동 테스트용입니다. 두 프로그램의 기본 연결 방식과 수신 저장 위치가 다르므로 아래 사용 순서를 확인하세요.
 
-## 일반 사용자용 배포 후보 v1.0.0
+## 개발 브랜치의 GUI·자동 수신 개선 (미배포)
 
-Windows x64용 ZIP 배포를 준비 중입니다. **아직 v1.0.0 태그나 Release를 게시하지 않았습니다.** 저장소가 Private이면 접근 권한이 있는 사용자만 Release를 받을 수 있습니다. 공개 범위 변경은 별도 결정 사항입니다.
+현재 소스에서는 메인 창의 **대화 창 열기**로 독립 창을 열어 채팅합니다. 창 이동·크기 조절·최대화를 지원하며 **Enter 전송 / Shift+Enter 줄바꿈**입니다. 대화 창을 닫아도 연결·파일 전송은 유지되고 재열기 시 기록·초안이 남습니다.
 
-게시 후에는 [GitHub Releases](https://github.com/royjwseo/FileTransferApp/releases)에서 `FileTransferApp-v1.0.0-win-x64.zip`을 받아 모두 압축 해제한 뒤 `FileTransferAppGui.exe`를 실행합니다. Visual Studio/Git이나 앱 설치 프로그램은 필요하지 않지만, 최신 [Microsoft Visual C++ v14 x64 Redistributable](https://aka.ms/vc14/vc_redist.x64.exe)이 필요합니다. 기존 동적 런타임 설정을 유지했습니다.
+기본 GUI는 **최초 연결 승인 후 해당 상대의 파일을 지정한 다운로드 폴더로 자동 수신**합니다. 파일별 승인/거절 버튼은 없습니다. 연결을 승인하기 전에 상대 IP와 다운로드 폴더를 확인하세요. 저장 경로·파일명·공간·중복·SHA-256 검증 및 완료 ACK는 유지합니다. 명시적 CLI 호환 진단 모드는 수동 파일 승인을 유지합니다.
+
+이는 게시된 v1.0.0 ZIP과 다른 개발 중 동작입니다. 아래 기존 사용 순서 중 파일별 승인 안내는 **v1.0.0 및 legacy 진단 모드**에 해당하며, 새 기본 GUI에서는 자동 준비로 대체됩니다. 이전 버전의 실제 2PC 연결·전송 성공은 사용자 확인이며, 이번 수정본의 2PC 검증은 별도로 필요합니다. [구조·상태 머신·검증 기록](tests/CHAT_AUTO_RECEIVE.md)을 참고하세요.
+## 일반 사용자용 배포 v1.0.0
+
+Windows x64용 v1.0.0 ZIP이 [GitHub Releases](https://github.com/royjwseo/FileTransferApp/releases/tag/v1.0.0)에 게시되어 있습니다. 저장소가 Private이면 접근 권한이 있는 사용자만 Release를 받을 수 있습니다. 공개 범위 변경은 별도 결정 사항입니다.
+
+[GitHub Releases](https://github.com/royjwseo/FileTransferApp/releases)에서 `FileTransferApp-v1.0.0-win-x64.zip`을 받아 모두 압축 해제한 뒤 `FileTransferAppGui.exe`를 실행합니다. Visual Studio/Git이나 앱 설치 프로그램은 필요하지 않지만, 최신 [Microsoft Visual C++ v14 x64 Redistributable](https://aka.ms/vc14/vc_redist.x64.exe)이 필요합니다. 기존 동적 런타임 설정을 유지했습니다.
 
 후보 대상은 Windows 10 1703 이상 / Windows 11 x64이며 전체 OS 조합의 검증 완료를 뜻하지 않습니다. EXE는 코드 서명되지 않았고 SmartScreen/SAC/조직 정책으로 차단될 수 있습니다. 정책을 끄거나 우회하지 마세요.
 
@@ -27,7 +34,7 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File tools/test-package.ps1
 
 출력은 Git에서 제외한 `dist/FileTransferApp-v1.0.0-win-x64.zip`과 `dist/SHA256SUMS.txt`입니다. 패키징은 GUI EXE·README.txt·LICENSE.txt만 포함하며 기존의 다른 내용인 ZIP을 덮어쓰지 않습니다. 버전의 기준은 `FileTransferApp/include/AppVersion.h`입니다.
 
-Actions는 태그 push 또는 수동 실행으로 전체 512개 검증과 ZIP 검사를 시도합니다. GUI 데스크톱이 없거나 검사에 실패하면 패키지 업로드·Release 단계를 진행하지 않습니다. Release 생성은 기존 버전 태그를 확인한 뒤 **초안으로만** 수행하며 공개 게시와 태그 생성은 별도 승인이 필요합니다. 원격 Actions 환경의 GUI 동작은 로컬 검사 통과와 구분합니다.
+Actions는 태그 push 또는 수동 실행으로 전체 회귀 검증과 ZIP 검사를 시도합니다. GUI 데스크톱이 없거나 검사에 실패하면 패키지 업로드·Release 단계를 진행하지 않습니다. Release 생성은 기존 버전 태그를 확인한 뒤 **초안으로만** 수행하며 공개 게시와 태그 생성은 별도 승인이 필요합니다. 원격 Actions 환경의 GUI 동작은 로컬 검사 통과와 구분합니다.
 ## 주요 기능
 
 | 기능 | 설명 |

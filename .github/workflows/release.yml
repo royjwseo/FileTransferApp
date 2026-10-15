@@ -29,7 +29,7 @@ jobs:
           $desktop=[DesktopProbe]::OpenInputDesktop(0,$false,0x100)
           if($desktop -eq [IntPtr]::Zero){throw 'Interactive desktop unavailable. GUI tests cannot be skipped; release blocked.'}
           [DesktopProbe]::CloseDesktop($desktop) | Out-Null
-      - name: Build and validate Debug and Release (512 checks)
+      - name: Build and validate Debug and Release (574 checks)
         shell: powershell
         run: ./tools/test-release.ps1
       - name: Package validated Release GUI

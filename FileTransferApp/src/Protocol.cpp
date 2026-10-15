@@ -181,7 +181,7 @@ uint64_t Protocol::ApproveFileRequest(const IncomingFileRequest& request,
         generation_ != request.generation) return 0;
     const auto id = incomingId_;
     if (!error.empty()) {
-        EventState("Failed: recovery validation",false,id);
+        EventState(("Failed: receive preparation: " + error).c_str(),false,id);
         replies_.push_back({ MessageType::FileError, id, error.substr(0, 256) });
         ClearIncoming(); return id;
     }
