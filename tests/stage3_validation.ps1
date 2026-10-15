@@ -19,10 +19,19 @@ function Wait-Count($app,[string]$text,[int]$count,[int]$timeout = 5000) {
 }
 function Wait-FileState([string]$path,[bool]$exists,[int]$timeout = 5000) {
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    while ((Test-Path -LiteralPath $path) -ne $exists -and $watch.ElapsedMilliseconds -lt $timeout) {
+    $lastLookupError = $null
+    while ($watch.ElapsedMilliseconds -lt $timeout) {
+        try {
+            if ((Test-Path -LiteralPath $path -ErrorAction Stop) -eq $exists) { return }
+        } catch {
+            # A delete-pending Win32 object can temporarily deny attribute lookup.
+            # Retry observation; never treat denied access as proof of absence.
+            if ($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::PermissionDenied) { throw }
+            $lastLookupError = $_.Exception.Message
+        }
         Start-Sleep -Milliseconds 10
     }
-    Assert ((Test-Path -LiteralPath $path) -eq $exists) "Unexpected file existence ($exists): $path"
+    throw "Expected file existence ($exists) not observed: $path; last lookup error: $lastLookupError"
 }
 function Assert-Hash([string]$source,[string]$saved) {
     Assert ($script:sourceHashes.ContainsKey($source)) 'Missing pre-transfer SHA-256'

@@ -1,4 +1,4 @@
-﻿# 독립 대화 창과 자동 파일 수신
+# 독립 대화 창과 자동 파일 수신
 
 ## 기준과 사용자 피드백
 
@@ -142,6 +142,46 @@ requestId replay·설정 검증 후 쓰기 권한 철회 시 오류 응답을 �
 자동화 문제가 있었다. 실제 대상 창을 표시하고 포커스를 확인하며, 새 파일명을 먼저
 기다리도록 고쳤다. 실패 실행은 통과 수에 중복 합산하지 않았다.
 정지 후 픽셀 일치는 움직이는 동안의 잔상이나 모든 DPI 환경을 보증하지 않는다.
+
+## 사용자 앱 정상 종료 후 추가 검증
+
+사용자 허가를 받아 PID 6952의 경로를 확인하고 CloseMainWindow로 정상 종료했다.
+강제 종료하지 않았으며 TCP 9000 리스너가 해제된 것을 확인했다.
+2026-10-15 추가 Rebuild에서 Debug/Release x64는 모두 성공했다.
+
+| 최신 Rebuild 산출물 기준 | Debug | Release |
+|---|---:|---:|
+| CLI/네트워크/Unicode 회귀 | 164/164 PASS | 164/164 PASS |
+| 기존 GUI·LAN·스크롤 | 92/92 PASS | 92개 실행 차단 |
+| 신규 대화·자동 수신 | 31/31 PASS | 31개 실행 차단 |
+| 합계 | **287/287 PASS** | **164/287 PASS, 123개 실행 차단** |
+
+최신 산출물 기준 총 **451/574 PASS**다. 앞서 통과한 Release GUI 결과는 이전 빌드의
+결과이며, 이를 최신 실행 차단 결과와 합쳐 전체 회귀가 통과했다고 보고하지 않는다.
+전체 runner는 실패 종료했고 새 배포 패키지나 Release를 게시하지 않았다.
+
+Debug stage4의 최초 실행은 삭제 중인 part 파일의 속성 조회가 일시적으로 거부되어
+14/19에서 중단됐다. Wait-FileState는 PermissionDenied만 기존 제한 시간 내에서
+재조회하도록 수정했다. 접근 거부를 파일 부재로 간주하지 않으며 지속되면 실패한다.
+stage3_validation 16개 및 stage4 19개 재실행은 모두 통과했다.
+
+LAN 검사에는 다른 실제 PC(192.168.0.191)의 발견 응답이 남아 있었다.
+테스트 시작 시 이미 발견된 외부 peer ID를 기준값으로 기록하고 시험용 기기 수에서만
+제외하도록 자동화 도구를 수정했다. 새로 주입한 peer, 자기 자신 제외 검증과 전체 테이블
+용량 제한 검사는 유지한다. 해당 PC를 종료하거나 제품의 발견 동작을 바꾸지 않았다.
+Debug LAN 25개 재실행은 모두 통과했다. 두 수정은 테스트 관찰 코드에 한정된다.
+
+Release GUI 시작은 Windows Application Control에 의해 차단됐다.
+CodeIntegrity 3033/3077 이벤트를 읽기 전용으로 수집했다.
+차단 파일 SHA-256: `A642DDEDC39CC75E0A863140287524165560C7BEB023685F71BAF788681F5FBB`.
+정책 변경, 파일명 변경 또는 재빌드를 통한 차단 우회는 하지 않았다.
+Release GUI의 최신 산출물 실행 검증은 정상 허용된 환경에서 추가로 필요하다.
+
+추가 로그(기존 실패 로그 보존):
+- `tests/runs/chat-auto/isolated-regression.log`
+- `tests/runs/release-validation-680acd52677e462b9c7145db96229570/results.json` (최초 추가 runner 결과)
+- 같은 디렉터리의 `stage3_validation-Debug-recheck.log`, `stage4-Debug-recheck.log`, `stage8_lan-Debug-recheck.log`
+- 같은 디렉터리의 `GUI-ApplicationControl.json`
 
 ## 남은 실제 2PC 검증
 

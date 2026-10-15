@@ -5,7 +5,9 @@ $runDir=Join-Path $PSScriptRoot ('runs/lan-'+[Guid]::NewGuid().ToString('N'));Ne
 function Assert($yes,[string]$message){if(!$yes){throw $message}}
 function Pass([string]$message){"PASS: $message"}
 function App([string]$name){$dir=Join-Path $runDir $name;New-Item -ItemType Directory $dir | Out-Null;$g=[GuiDriver]::new($Exe,$dir,$true,$false);$g.Wait(141,'LAN ready:');$text=$g.Text(141);Assert ($text -match 'LAN ready: ([a-f0-9]{32}) TCP=(\d+)') 'LAN startup missing';return @{G=$g;ID=$Matches[1];Port=[int]$Matches[2];Dir=$dir}}
-function Wait-Devices($a,[int]$count,[int]$timeout=12000){$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds -lt $timeout){if($a.G.Devices().Count -eq $count){return};Start-Sleep -Milliseconds 50};throw "Device count mismatch: $($a.G.Devices() -join ';')"}
+$script:ExternalPeers=@()
+function Test-Devices($a){return @($a.G.Devices() | Where-Object {$_ -notmatch '\[([a-f0-9]{8})\]$' -or $Matches[1] -notin $script:ExternalPeers})}
+function Wait-Devices($a,[int]$count,[int]$timeout=12000){$watch=[Diagnostics.Stopwatch]::StartNew();while($watch.ElapsedMilliseconds -lt $timeout){if(@(Test-Devices $a).Count -eq $count){return};Start-Sleep -Milliseconds 50};throw "Device count mismatch: $($a.G.Devices() -join ';')"}
 function Select-Peer($a,$b){$rows=$a.G.Devices();$index=-1;for($i=0;$i -lt $rows.Length;$i++){if($rows[$i].Contains($b.ID.Substring(0,8))){$index=$i;break}};Assert ($index -ge 0) 'Expected peer missing';$a.G.SelectDevice($index)}
 function Udp([byte[]]$bytes){$u=[Net.Sockets.UdpClient]::new();try{[void]$u.Send($bytes,$bytes.Length,'127.0.0.1',9001)}finally{$u.Dispose()}}
 function Packet([string]$text){Udp ([Text.Encoding]::UTF8.GetBytes($text))}
@@ -14,12 +16,18 @@ function Connect-Pair($a,$b){Select-Peer $a $b;$a.G.Click(136);$b.G.Wait(138,'un
 function Save-Log($a){if($a){try{[IO.File]::WriteAllText((Join-Path $a.Dir 'ui.log'),$a.G.Text(108))}catch{}}}
 $a=$null;$b=$null
 try {
-    $a=App 'a';Start-Sleep -Seconds 3;Wait-Devices $a 0;Pass 'default GUI starts discovery and consent listener without establishing a transfer session'
+    $a=App 'a';Start-Sleep -Seconds 3
+    # Snapshot only already-present external peers. Newly injected IDs still
+    # count, as does our own ID if incorrectly displayed. The flood test below
+    # continues to check the full table, including external peers.
+    foreach($row in $a.G.Devices()){if($row -match '\[([a-f0-9]{8})\]$' -and $Matches[1] -notin @($a.ID.Substring(0,8),'aaaaaaaa','ffffffff')){$script:ExternalPeers+=$Matches[1]}}
+    Write-Output "INFO: external discovery baseline: $($script:ExternalPeers -join ',')"
+    Wait-Devices $a 0;Pass 'default GUI starts discovery and consent listener without establishing a transfer session'
     Packet "FTA-DISC|1|R|$($a.ID)|$($a.Port)|Self";Start-Sleep -Milliseconds 300;Wait-Devices $a 0;Pass 'own instance discovery response excluded'
     foreach($bad in @('not an app',('FTA-DISC|99|R|'+('a'*32)+'|9000|WrongVersion'),('FTA-DISC|1|R|'+('a'*32)+'|0|BadPort'),('FTA-DISC|1|R|'+('a'*32)+'|9000|../fake|extra'),('FTA-DISC|1|R|'+('a'*32)+'|9000|'+('x'*97)))){Packet $bad}
     Udp ([byte[]]@(70,84,65,45,68,73,83,67,124,49,124,82,124,255));Udp ([byte[]]::new(1024));Start-Sleep -Milliseconds 500;Wait-Devices $a 0;Pass 'malformed, oversized, invalid UTF-8, invalid ports and wrong discovery version rejected'
     $fake='f'*32;for($i=0;$i -lt 4;$i++){Packet "FTA-DISC|1|R|$fake|43210|Fake device"};Wait-Devices $a 1
-    Assert ($a.G.Devices()[0].Contains('127.0.0.1:43210')) 'Did not use UDP source address';Pass 'UDP response source IP used and duplicate instance responses coalesced'
+    Assert (@(Test-Devices $a)[0].Contains('127.0.0.1:43210')) 'Did not use UDP source address';Pass 'UDP response source IP used and duplicate instance responses coalesced'
     Wait-Devices $a 0 12000;Pass 'silent discovery candidate expires after bounded TTL'
     $b=App 'b';$a.G.Click(135);$b.G.Click(135);Wait-Devices $a 1;Wait-Devices $b 1;Pass 'two actual GUI processes discover each other over UDP multicast'
     Assert (!$a.G.Enabled(110) -and !$b.G.Enabled(110)) 'Discovery enabled file/text session';Pass 'discovery does not auto-connect or enable transfer commands'
