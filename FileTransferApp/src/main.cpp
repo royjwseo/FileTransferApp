@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "Network.h"
+#include "AppVersion.h"
 
 namespace
 {
@@ -32,7 +33,7 @@ namespace
     };
     void PrintVersion()
     {
-        std::osyncstream(std::cout) << "FileTransferApp protocol=" << Protocol::WIRE_VERSION
+        std::osyncstream(std::cout) << "FileTransferApp version=" FTA_VERSION_STRING " protocol=" << Protocol::WIRE_VERSION
             << " requestId64-parity maxFileBytes=" << Protocol::MAX_FILE_SIZE << '\n';
     }
 

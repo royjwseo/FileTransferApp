@@ -1,6 +1,7 @@
 ﻿#define NOMINMAX
 #include "Network.h"
 #include "Gui.h"
+#include "AppVersion.h"
 #include "GuiSettings.h"
 #include "LanService.h"
 #include "FileName.h"
@@ -449,7 +450,7 @@ int RunGui(HINSTANCE instance,int show,bool legacy) {
     if(!RegisterClassExW(&klass))return 1;
     Window window;window.instance=instance;window.legacy=legacy;window.dpi=GetDpiForSystem();
     RECT desktop{};SystemParametersInfoW(SPI_GETWORKAREA,0,&desktop,0);
-    HWND hwnd=CreateWindowExW(0,klass.lpszClassName,L"FileTransferApp — LAN 파일 전송",WS_OVERLAPPEDWINDOW|WS_VSCROLL,
+    HWND hwnd=CreateWindowExW(0,klass.lpszClassName,L"FileTransferApp v" FTA_VERSION_W L" — LAN 파일 전송",WS_OVERLAPPEDWINDOW|WS_VSCROLL,
         CW_USEDEFAULT,CW_USEDEFAULT,std::min(window.Scale(900),static_cast<int>(desktop.right-desktop.left)),std::min(window.Scale(850),static_cast<int>(desktop.bottom-desktop.top)),nullptr,nullptr,instance,&window);
     if(!hwnd)return 1;
     ShowWindow(hwnd,show);UpdateWindow(hwnd);

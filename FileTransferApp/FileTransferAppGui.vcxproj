@@ -163,6 +163,16 @@
   </ItemDefinitionGroup>
   <PropertyGroup><OutDir>$(ProjectDir)x64\$(Configuration)\</OutDir><IntDir>$(ProjectDir)obj-gui\$(Configuration)\$(Platform)\</IntDir></PropertyGroup>
   <ItemDefinitionGroup><ClCompile><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile></ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="include\AppVersion.h" />
+    <ResourceCompile Include="resources\App.rc" />
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ResourceCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ResourceCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <Link><AdditionalOptions>/PDBALTPATH:FileTransferAppGui.pdb %(AdditionalOptions)</AdditionalOptions></Link>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

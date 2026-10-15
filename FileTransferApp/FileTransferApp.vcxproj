@@ -156,6 +156,16 @@
       <EnableSegmentHeap>true</EnableSegmentHeap>
     </Manifest>
   </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="include\AppVersion.h" />
+    <ResourceCompile Include="resources\App.rc" />
+  </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ResourceCompile><PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions></ResourceCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <Link><AdditionalOptions>/PDBALTPATH:FileTransferApp.pdb %(AdditionalOptions)</AdditionalOptions></Link>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -1,0 +1,12 @@
+﻿FileTransferApp — 라이선스 미지정 / 권리 보유 안내
+
+Copyright (c) 2026 royjwseo. All rights reserved.
+
+이 프로젝트에는 별도의 오픈 소스 라이선스가 부여되지 않았습니다.
+이 안내는 소스 또는 실행 파일의 복제, 수정, 재배포, 상업적 이용에 대한
+새로운 허가를 부여하지 않습니다. 필요한 사용 허가는 권리자에게 문의하세요.
+적용 법률이 인정하는 권리는 이 안내로 제한되지 않습니다.
+
+이 배포에는 Microsoft Visual C++ Redistributable 또는 Windows DLL이
+포함되지 않습니다. 해당 소프트웨어는 Microsoft의 라이선스가 적용되며
+공식 배포처에서 별도로 설치합니다.

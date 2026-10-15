@@ -1,0 +1,94 @@
+﻿name: Release candidate
+on:
+  workflow_dispatch:
+    inputs:
+      create_draft:
+        description: 'Create a draft only (requires an existing matching version tag)'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  validate-package:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require an interactive desktop
+        shell: powershell
+        run: |
+          Add-Type 'using System; using System.Runtime.InteropServices; public static class DesktopProbe { [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access); [DllImport("user32.dll")] public static extern bool CloseDesktop(IntPtr h); }'
+          $desktop=[DesktopProbe]::OpenInputDesktop(0,$false,0x100)
+          if($desktop -eq [IntPtr]::Zero){throw 'Interactive desktop unavailable. GUI tests cannot be skipped; release blocked.'}
+          [DesktopProbe]::CloseDesktop($desktop) | Out-Null
+      - name: Build and validate Debug and Release (512 checks)
+        shell: powershell
+        run: ./tools/test-release.ps1
+      - name: Package validated Release GUI
+        shell: powershell
+        run: ./tools/package-release.ps1
+      - name: Verify repeatable packaging
+        shell: powershell
+        run: ./tools/package-release.ps1
+      - name: Validate ZIP and extracted GUI
+        shell: powershell
+        run: ./tools/test-package.ps1
+      - name: Preserve test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs
+          path: |
+            tests/runs/**/*.log
+            tests/runs/**/results.json
+            tests/runs/**/CodeIntegrity*.json
+            tests/runs/scroll-*/**/*.png
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+  draft-release:
+    needs: validate-package
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.create_draft == true
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-package
+          path: dist
+      - name: Upload a new draft without creating or changing tags
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          . ./tools/ReleaseCommon.ps1
+          $version=Get-ReleaseVersion
+          $tag="v$version"
+          if('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne $tag){throw 'Tag does not match source version.'}
+          $tagSha=git rev-list -n 1 $tag
+          if($LASTEXITCODE -ne 0 -or $tagSha -ne (git rev-parse HEAD)){throw 'An existing matching tag at this commit is required. No tag will be created.'}
+          $releases=gh api --paginate "repos/$env:GH_REPO/releases" --jq '.[].tag_name'
+          if($LASTEXITCODE -ne 0){throw 'Cannot inspect existing releases; refusing upload.'}
+          if($releases -contains $tag){throw "Release $tag already exists; refusing overwrite."}
+          $zip="dist/FileTransferApp-$tag-win-x64.zip"
+          gh release create $tag $zip dist/SHA256SUMS.txt --verify-tag --draft --title "FileTransferApp $tag" --notes-file packaging/RELEASE_NOTES.md
+          if($LASTEXITCODE -ne 0){throw 'Draft release upload failed.'}
+# This workflow never publishes a public release. Review and explicit publication are separate.
