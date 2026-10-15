@@ -51,9 +51,10 @@ foreach ($case in @('restart','restart-twice','tamper','manifest-tamper','foreig
         Assert $locked 'Source was writable while a send owned it'
         $pair = Restart-Pair $pair
         Assert ((Get-Item $part).Length -eq 262144) 'Incorrect checkpoint offset'
-        Assert (Test-Path ($part + '.fta')) 'Missing durable ownership metadata'
+        $metadata=[MetadataProbe]::PathFor($pair.HostApp.Process.StartInfo.WorkingDirectory,[IO.Path]::GetDirectoryName($part),$id)
+        Assert (Test-Path $metadata) 'Missing durable ownership metadata'
         if($case -in @('manifest-tamper','foreign-part','new-request')) {
-            if($case -eq 'manifest-tamper') { [IO.File]::WriteAllBytes(($part + '.fta'),[byte[]](1..100)) }
+            if($case -eq 'manifest-tamper') { [IO.File]::WriteAllBytes($metadata,[byte[]](1..100)) }
             if($case -eq 'foreign-part') {
                 Move-Item -LiteralPath $part -Destination ($part + '.saved')
                 [IO.File]::WriteAllText($part,'unowned replacement')

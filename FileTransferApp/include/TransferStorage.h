@@ -65,10 +65,11 @@ public:
 private:
     explicit TransferStorage(TransferSpec spec, std::filesystem::path folder = {});
     TransferSpec spec_;
-    OwnedHandle directory_, data_, manifest_;
+    OwnedHandle directory_, metadataDirectory_, data_, manifest_;
     std::filesystem::path folder_, final_, part_, manifestPath_;
     std::unique_ptr<Sha256> hash_;
     uint64_t offset_ = 0;
     bool complete_ = false, ownsData_ = false;
     void PinDirectory(bool create);
+    void PinMetadataDirectory();
 };

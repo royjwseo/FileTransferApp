@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <wincrypt.h>
+#include <shlobj.h>
 #include <array>
 #include <cstring>
 #include <stdexcept>
@@ -22,6 +23,8 @@
 #endif
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 std::wstring FileName::ToWide(std::string_view utf8) {
     if (utf8.empty()) return {};
@@ -206,10 +209,27 @@ void TransferStorage::PinDirectory(bool create) {
     final_ = folder / FileName::ToWide(spec_.name); part_ = final_; part_ += ".part";
     manifestPath_ = part_; manifestPath_ += ".fta";
 }
+void TransferStorage::PinMetadataDirectory() {
+    wchar_t overridePath[32768]{};DWORD n=GetEnvironmentVariableW(L"FILETRANSFER_METADATA_ROOT",overridePath,32768);
+    std::filesystem::path root;
+    if(n){Require(n<32768&&std::filesystem::path(overridePath).is_absolute(),"Metadata root must be absolute");root=overridePath;}
+    else{PWSTR value=nullptr;Require(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,nullptr,&value)),"Cannot locate metadata directory");root=std::filesystem::path(value)/L"FileTransferApp"/L"transfer-metadata";CoTaskMemFree(value);}
+    auto native=root.wstring();
+    if(!native.starts_with(L"\\\\?\\"))root=native.starts_with(L"\\\\")?L"\\\\?\\UNC\\"+native.substr(2):L"\\\\?\\"+native;
+    std::filesystem::create_directories(root);
+    metadataDirectory_=OwnedHandle(CreateFileW(root.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    Require(bool(metadataDirectory_),"Cannot open metadata directory");FileIdentity(metadataDirectory_.value,true);
+    // Directory identity avoids path aliases/case and separates identical transfer IDs in different destinations.
+    Require(HexDigest(spec_.transferId),"Invalid metadata transfer identity");
+    Sha256 key;key.Add(FileIdentity(directory_.value,true));key.Add(spec_.transferId);
+    manifestPath_=root/(key.Hex()+".fta");
+}
 std::unique_ptr<TransferStorage> TransferStorage::Create(const TransferSpec& spec, const std::filesystem::path& folder) {
     auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec, folder));
     try {
         store->PinDirectory(true);
+        store->PinMetadataDirectory();
         Require(!std::filesystem::exists(std::filesystem::symlink_status(store->final_)), "Destination already exists");
         ULARGE_INTEGER available{};
         Require(GetDiskFreeSpaceExW(store->final_.parent_path().c_str(), &available, nullptr, nullptr),
@@ -244,8 +264,17 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     const std::function<bool()>& cancelled, const std::filesystem::path& folder) {
     auto store = std::unique_ptr<TransferStorage>(new TransferStorage(spec, folder));
     store->PinDirectory(false);
+    const auto legacy=store->manifestPath_;
+    store->PinMetadataDirectory();
     store->manifest_ = OwnedHandle(CreateFileW(store->manifestPath_.c_str(), GENERIC_READ | DELETE,
         0, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    const DWORD metadataError=store->manifest_?ERROR_SUCCESS:GetLastError();
+    bool migrating=false;
+    // Only a missing central record permits the legacy lookup. Corruption/access failures never downgrade.
+    if(!store->manifest_&&(metadataError==ERROR_FILE_NOT_FOUND||metadataError==ERROR_PATH_NOT_FOUND)){
+        store->manifest_=OwnedHandle(CreateFileW(legacy.c_str(),GENERIC_READ|DELETE,0,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+        migrating=bool(store->manifest_);
+    }
     Require(bool(store->manifest_), "No owned resume metadata"); FileIdentity(store->manifest_.value);
     LARGE_INTEGER length{};
     Require(GetFileSizeEx(store->manifest_.value, &length) && length.QuadPart > 0 && length.QuadPart <= 4096,
@@ -273,6 +302,18 @@ std::unique_ptr<TransferStorage> TransferStorage::Recover(const TransferSpec& sp
     store->hash_ = HashPrefix(store->data_.value, store->offset_, cancelled);
     if (store->complete_) Require(store->offset_ == spec.size && store->hash_->Hex() == spec.digest,
         "Committed file integrity mismatch");
+    if(migrating){
+        // Copy protected bytes after full ownership/integrity validation; supports different volumes.
+        // Publication precedes removing the old owned record, so a crash never loses both copies.
+        auto publishing=store->manifestPath_;publishing+=L".new";
+        OwnedHandle updated(CreateFileW(publishing.c_str(),GENERIC_READ|GENERIC_WRITE|DELETE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr));
+        Require(bool(updated),"Cannot migrate resume metadata");DWORD written=0;
+        try{
+            Require(WriteFile(updated.value,sealed.data(),static_cast<DWORD>(sealed.size()),&written,nullptr)&&written==sealed.size()&&FlushFileBuffers(updated.value),"Cannot write migrated metadata");
+            RenameOwned(updated.value,store->manifestPath_);
+        }catch(...){DeleteOwned(updated.value);throw;}
+        DeleteOwned(store->manifest_.value);store->manifest_=std::move(updated);
+    }
     return store;
 }
 void TransferStorage::ValidateDirectory(const std::filesystem::path& folder) {
@@ -316,7 +357,7 @@ void TransferStorage::Abort(bool remove) {
     } else if (!remove && ownsData_ && !complete_ && data_) {
         Require(FlushFileBuffers(data_.value), "Cannot checkpoint owned partial file");
     }
-    data_.Reset(); manifest_.Reset(); directory_.Reset(); ownsData_ = false;
+    data_.Reset(); manifest_.Reset(); metadataDirectory_.Reset(); directory_.Reset(); ownsData_ = false;
 }
 
 void FileTransfer::Start(std::string name, uint64_t id, uint64_t total, bool sending, uint64_t initial)

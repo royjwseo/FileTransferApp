@@ -4,6 +4,7 @@ $Exe = (Resolve-Path $Exe).Path
 # Each invocation owns its processes and files; existing received files are untouched.
 $runDir = Join-Path $PSScriptRoot ('runs/' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force $runDir | Out-Null
+if(!('MetadataProbe' -as [type])){Add-Type -Path "$PSScriptRoot/MetadataProbe.cs"}
 Add-Type -TypeDefinition @'
 using System;
 using System.Diagnostics;
@@ -23,6 +24,7 @@ public sealed class TestApp : IDisposable {
             StandardOutputEncoding = new UTF8Encoding(false, true),
             StandardErrorEncoding = new UTF8Encoding(false, true),
             RedirectStandardError = true } };
+        Process.StartInfo.EnvironmentVariables["FILETRANSFER_METADATA_ROOT"]=Path.Combine(cwd,"transfer-metadata");
         Process.Start();
         stdout = new Thread(() => Read(Process.StandardOutput));
         stderr = new Thread(() => Read(Process.StandardError));
@@ -300,10 +302,10 @@ try {
     while (!(Test-Path $part) -and $watch.ElapsedMilliseconds -lt 3000) {
         Start-Sleep -Milliseconds 10
     }
-    Assert (Test-Path $part) 'Expected an active partial file'
+    Assert (Test-Path $part) ('Expected an active partial file. Receiver output: '+$c.App.Output)
     $c.Peer.Close()
     $c.App.WaitText('Peer disconnected.')
-    Assert ((Test-Path $part) -and (Test-Path ($part + '.fta'))) 'Owned resume checkpoint was not retained'
+    Assert ((Test-Path $part) -and (Test-Path ([MetadataProbe]::Find($c.App.Process.StartInfo.WorkingDirectory,[IO.Path]::GetDirectoryName($part))))) 'Owned resume checkpoint was not retained'
     $c.App.Send('/quit'); $c.App.WaitExit()
     Pass 'peer disconnect closes handles and retains authenticated resume checkpoint (stage5 policy)'
 } finally { $c.Peer.Dispose(); $c.App.Dispose() }

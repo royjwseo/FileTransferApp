@@ -241,7 +241,7 @@ foreach ($mode in @('cut-connection','kill-sender','quit-sender')) {
         }
         $pair.HostApp.WaitText('Peer disconnected.',5000)
         Wait-FileState $part $true
-        Assert (Test-Path ($part + '.fta')) 'Missing authenticated resume checkpoint'
+        Assert (Test-Path ([MetadataProbe]::Find($pair.HostApp.Process.StartInfo.WorkingDirectory,[IO.Path]::GetDirectoryName($part)))) 'Missing authenticated resume checkpoint'
         Assert (!(Test-Path -LiteralPath (Saved-Path $pair.HostApp 'large-100MiB.bin'))) 'Interrupted transfer committed'
         $pair.HostApp.Send('/quit'); $pair.HostApp.WaitExit()
         Pass "interrupted actual upload retains owned resume checkpoint: $mode"

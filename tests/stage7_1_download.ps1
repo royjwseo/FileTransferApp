@@ -50,8 +50,8 @@ try {
     Assert (!(Test-Path (Join-Path $changed '변경 중.dat'))) 'Active transfer migrated folders';Pass 'changing default during active transfer keeps pinned original destination'
     $id=$c.Text(124);$c.Click(126);$h.Wait(115,'변경 중.dat');$h.Click(116);$c.Wait(122,'Failed:');
     Assert (!(Test-Path (Join-Path $changed '변경 중.dat'))) 'Wrong folder reused transfer';Pass 'completion lookup after folder change refuses unrelated metadata'
-    $oldFile=Join-Path $hd 'received/변경 중.dat';$oldMeta=$oldFile+'.part.fta'
-    $newFile=Join-Path $changed '변경 중.dat';$newMeta=$newFile+'.part.fta'
+    $oldFile=Join-Path $hd 'received/변경 중.dat';$oldMeta=[MetadataProbe]::PathFor($hd,[IO.Path]::GetDirectoryName($oldFile),$id)
+    $newFile=Join-Path $changed '변경 중.dat';$newMeta=[MetadataProbe]::PathFor($hd,$changed,$id)
     Move-Item -LiteralPath $oldFile -Destination $newFile;Move-Item -LiteralPath $oldMeta -Destination $newMeta
     $c.Click(125);$h.Wait(115,'변경 중.dat');$h.Click(116);$c.Wait(122,'Failed:')
     Assert (Test-Path -LiteralPath $newFile) 'Rejected recovery removed moved file';Pass 'moving data and sealed metadata to another directory fails directory identity check'

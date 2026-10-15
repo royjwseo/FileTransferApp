@@ -27,6 +27,7 @@ public sealed class GuiDriver : IDisposable {
         Process=new Process {StartInfo=new ProcessStartInfo(exe){WorkingDirectory=cwd,UseShellExecute=false,WindowStyle=ProcessWindowStyle.Hidden}};
         string settings=System.IO.Path.Combine(cwd,"gui-settings.txt");
         Process.StartInfo.EnvironmentVariables["FILETRANSFER_GUI_SETTINGS"]=settings;
+        Process.StartInfo.EnvironmentVariables["FILETRANSFER_METADATA_ROOT"]=System.IO.Path.Combine(cwd,"transfer-metadata");
         if(seedSettings&&!System.IO.File.Exists(settings)){
             string received=System.IO.Path.Combine(cwd,"received");System.IO.Directory.CreateDirectory(received);
             System.IO.File.WriteAllText(settings,received,new UTF8Encoding(false));
