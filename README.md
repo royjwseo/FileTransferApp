@@ -1,7 +1,7 @@
-# FileTransferApp — N:1 개발 브랜치
+# FileTransferApp v1.2.0 — N:1 다중 클라이언트
 
 이 브랜치는 `feature/chat-auto-receive`의 v1.1.0 이후 **N:1 다중 클라이언트 개발본**입니다.
-게시된 v1.1.0 ZIP과 구분하세요. 기존 Release와 main은 변경하지 않습니다.
+[v1.2.0 N:1 Release](https://github.com/royjwseo/FileTransferApp/releases/tag/v1.2.0)에서 `FileTransferApp-v1.2.0-win-x64.zip`을 받아 실행하세요. 기존 v1.1.0은 1:1 Release로 보존하며 main은 변경하지 않습니다.
 
 GUI를 인자 없이 실행하고 상단에서 **서버 모드 / 클라이언트 모드** 및 표시 이름을 적용합니다.
 서버는 최대 10개 상대를 수락하고 연결 목록에서 선택한 상대에게 파일·텍스트를 보냅니다.
